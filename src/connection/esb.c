@@ -5764,7 +5764,14 @@ static void relay_freeze_callback(int32_t channel, uint64_t expires, void *conte
 	ARG_UNUSED(channel);
 	ARG_UNUSED(expires);
 	struct relay_broadcast_work *w = context;
-	while ((int32_t)((NRF_RTC1->COUNTER - w->freeze_rtc) << 8) < 0) { }
+	unsigned polls = 65536;
+	while ((int32_t)((NRF_RTC1->COUNTER - w->freeze_rtc) << 8) < 0) {
+		if (!--polls) {
+			w->result = -ETIMEDOUT;
+			k_sem_give(&relay_freeze_done);
+			return;
+		}
+	}
 	unsigned key = irq_lock();
 	uint32_t lag = (NRF_RTC1->COUNTER - w->freeze_rtc) & 0x00ffffffU;
 	int err = relay_freeze_arm(&relay_coord, w);

@@ -26,6 +26,7 @@ prefix = r'''
 #define CONFIG_ESB_PIPE_COUNT 8
 #define ESB_MODE_PRX 1
 #define ESB_PROTOCOL_ESB_DPL 1
+#define ESB_STATE_UNINITIALIZED 0
 #define ESB_STATE_PRX 1
 #define ESB_STATE_PRX_BROADCAST 2
 #define NRF_RADIO ((void *)0)
@@ -54,7 +55,7 @@ static struct {void *p_reg;} esb_timer;
 static int esb_state=ESB_STATE_PRX;
 static volatile bool prx_broadcast_active;
 static void (*on_radio_disabled)(void);
-static bool pa,ppi,timer,fail,late;
+static bool pa,ppi,timer,fail,late,stuck;
 static bool broadcast_event_fired(uint32_t event){(void)event;return late;}
 static unsigned now,cc,restores,pipe,clears;
 static void start_rx_listening(void){esb_state=ESB_STATE_PRX;restores++;}
@@ -80,7 +81,7 @@ prefix += r"""
 static void esb_ppi_for_broadcast_disable_rx(void){ppi=false;}
 static void nrf_radio_int_disable(void *p,unsigned v){(void)p;(void)v;}
 static void nrf_radio_task_trigger(void *p,unsigned v){(void)p;(void)v;}
-static bool nrf_radio_event_check(void *p,unsigned v){(void)p;(void)v;return true;}
+static bool nrf_radio_event_check(void *p,unsigned v){(void)p;(void)v;return !stuck;}
 static void errata_216_off(void){}
 static void nrf_timer_shorts_set(void *p,unsigned v){(void)p;(void)v;}
 static void nrf_timer_int_disable(void *p,unsigned v){(void)p;(void)v;}
@@ -117,6 +118,15 @@ int main(void){
  assert(esb_prx_broadcast_arm_event(21,1234)==-ETIME);
  assert(esb_state==ESB_STATE_PRX && !pa && !ppi && !timer && !broadcast_begun);
  irq_unlock(key);late=false;
+ stuck=true;
+ assert(esb_prx_broadcast_prepare(&p));assert(!esb_prx_broadcast_begin());
+ assert(esb_prx_broadcast_arm_event(21,1234)==-ETIMEDOUT);
+ assert(!broadcast_begun && !ppi && esb_state==ESB_STATE_UNINITIALIZED);
+ esb_state=ESB_STATE_PRX;
+ assert(esb_prx_broadcast_prepare(&p));assert(!esb_prx_broadcast_begin());
+ late=true;assert(esb_prx_broadcast_arm_event(21,1234)==-ETIMEDOUT);
+ late=false;stuck=false;esb_state=ESB_STATE_PRX;
+ broadcast_length=0;assert(esb_prx_broadcast_begin()==-EBUSY);
  esb_state=9;assert(esb_prx_broadcast_prepare(&p));
  assert(esb_prx_broadcast_begin()==-EBUSY);
  esb_state=ESB_STATE_PRX;p.length=73;assert(!esb_prx_broadcast_prepare(&p));
