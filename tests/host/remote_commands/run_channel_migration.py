@@ -6,6 +6,7 @@ from pathlib import Path
 import shlex
 import re
 import subprocess
+import sys
 import tempfile
 
 HERE = Path(__file__).resolve().parent
@@ -43,7 +44,7 @@ def publication_function(name):
 
 
 functions = [
-    "decision_accept", "esb_auto_loss_invalidate", "esb_rx_discontinuity", "check_packet_sequence",
+    "decision_accept", "esb_auto_loss_invalidate", "esb_rx_discontinuity", "packet_stats_refresh", "packet_stats_count", "check_packet_sequence",
     "test_all_invalidate",
     "esb_channel_is_busy", "radio_operation_begin", "esb_radio_operation_begin",
     "esb_radio_collection_begin", "esb_radio_operation_end",
@@ -88,12 +89,21 @@ prelude = prelude.replace("/* DIAGNOSTIC DECLARATIONS */",
 # confirmation priority, command formats, OTA override and CRC generation.
 defines = []
 for line in header.splitlines():
-    match = re.match(r"#define (ESB_(?:(?:PING|PONG|RAW|OTA|CHANNEL_CONFIRM|WOM_TIMEOUT)_\w+|WOM_ENTER|METADATA_MASK_VALID))\s+", line)
+    match = re.match(r"#define (ESB_(?:(?:PING|PONG|RAW|OTA|COMPOSITE|CHANNEL_CONFIRM|WOM_TIMEOUT)_\w+|WOM_ENTER|METADATA_MASK_VALID))\s+", line)
     if match and not re.search(r"#define\s+" + match[1] + r"\b", prelude):
         defines.append(line)
 defines.extend(re.findall(r'^#define (?:PING_TIMEOUT_MS|PING_CLEAN_REACQUIRE_STREAK)\b[^\n]*',
                           source, re.MULTILINE))
 prelude = "\n".join(defines) + "\n" + prelude
+sys.path.insert(0, str(HERE.parent / "harness"))
+from relay_support import relay_section, staging_helpers  # noqa: E402
+if "tdma_active_mask" not in prelude + production:
+    production += "\n".join(re.findall(r"^static uint32_t tdma_active_mask;", source, re.MULTILINE)) + "\n"
+production += "\n" + relay_section(source, stats=False)
+production += "\n" + staging_helpers(source)
+production += '\n#include "tracker_event_protocol.h"\n'
+production += "\n".join(extract.function(source, name) for name in
+                         ("composite_body_length", "relay_early_receipt_valid"))
 production += "\n" + extract.function(source, "esb_ack_handler_cb")
 production += "\n" + extract.diagnostic_function(source, "account_ping_clock")
 production += "\n" + extract.function(source, "esb_receive_ping")
@@ -124,6 +134,6 @@ with tempfile.TemporaryDirectory(prefix="receiver-channel-migration-") as direct
             "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wno-unused-parameter",
             "-Wno-unused-function", "-Wno-unused-variable", "-g", "-O1",
             "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie",
-            *flags, str(generated), "-o", str(binary),
+            "-I", str(ROOT / "src/connection"), *flags, str(generated), "-o", str(binary),
         ], check=True)
         subprocess.run([str(binary)], check=True)

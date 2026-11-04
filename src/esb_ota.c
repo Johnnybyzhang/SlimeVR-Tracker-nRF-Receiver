@@ -422,6 +422,11 @@ void esb_ota_relay_process_hid(const uint8_t *data, size_t len)
 			LOG_ERR("OTA: Invalid tracker ID %u", tracker_id);
 			break;
 		}
+		/* OTA runs over a direct link only, never through a relay head. */
+		if (esb_relay_blocks_ota(tracker_id)) {
+			LOG_WRN("OTA: tracker %u lacks a recent healthy direct link, refused", tracker_id);
+			break;
+		}
 		k_spinlock_key_t admission_key = k_spin_lock(&ota_relay_lock);
 		bool full = !ota_relay.tracker[tracker_id].participating &&
 			    ota_relay.num_targets >= OTA_MAX_PARALLEL;

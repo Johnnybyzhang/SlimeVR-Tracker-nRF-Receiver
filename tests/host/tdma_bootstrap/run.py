@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parent / 'harness'))
 from c_extract import extract_block
+from relay_support import relay_declarations
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source', type=Path, default=ROOT / 'src/connection/esb.c')
@@ -72,10 +73,12 @@ declarations = [
 ]
 declarations.extend(declaration(name) for name in variables)
 declarations.append(extract.diagnostic_loss_declarations(source))
+declarations.append(relay_declarations(source))
 functions = [function(name) for name in (
     'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
     'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
-    'tdma_membership_wait_ms', 'tdma_slot_ticks_for', 'tdma_recalculate',
+    'tdma_membership_wait_ms', 'tdma_slot_ticks_for', 'tdma_staging_supported_locked',
+    'tdma_apply_locked', 'tdma_apply_finish', 'tdma_advertised_config', 'tdma_recalculate',
     'tracker_store_restore',
 )]
 functions.append('static uint32_t sys_get_be32(const uint8_t *p) {\n'
@@ -111,6 +114,6 @@ with tempfile.TemporaryDirectory(prefix='receiver-tdma-membership-') as director
         subprocess.run(compiler + [
             '-std=c11', '-g', '-O1', '-Wall', '-Wextra',
             '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
-            '-fno-pie', '-no-pie', *flags, str(generated), '-o', str(executable),
+            '-fno-pie', '-no-pie', '-I', str(ROOT / 'src/connection'), *flags, str(generated), '-o', str(executable),
         ], check=True)
         subprocess.run([str(executable)] + ([args.case] if args.case else []), check=True, timeout=20)

@@ -76,6 +76,9 @@ static void k_mutex_unlock(int *lock)
 }
 static int64_t k_uptime_get(void) { return (int64_t)now_ms; }
 static uint32_t k_uptime_get_32(void) { return (uint32_t)now_ms; }
+/* 32768 Hz kernel ticks, as on the receiver. */
+static int64_t k_uptime_ticks(void) { return (int64_t)now_ms * 32768 / 1000; }
+static uint32_t k_ms_to_ticks_ceil32(uint32_t ms) { return (uint32_t)(((uint64_t)ms * 32768 + 999) / 1000); }
 static uint8_t stored_trackers, saved_count;
 static uint64_t stored_tracker_addr[MAX_TRACKERS], saved_addr[MAX_TRACKERS];
 static int restore_error;
@@ -514,6 +517,66 @@ static void restore_retry(void)
     assert(!tdma_active_mask && !tdma_last_reconfig_valid);
 }
 
+/* Staged layout activation (relay_protocol.h): with every affected tracker
+ * relay-capable, a layout change is announced and applied at its activation
+ * tick; otherwise, or when forced, it is published immediately. */
+static uint32_t ticks_at(uint64_t ms) { return (uint32_t)(ms * 32768 / 1000); }
+
+static void two_member_layout(uint8_t count, bool capable_joiner)
+{
+    reset_fixture(count, 0); assert(tracker_store_restore() == 0);
+    relay_coord_init(&relay_coord);
+    for (uint8_t id = 0; id < count; ++id) {
+        if (id < 2 || capable_joiner) relay_coord_note_caps(&relay_coord, id, RELAY_INFO_CAPS);
+    }
+    assert(ping(0, true) && ping(1, true)); service();
+    now_ms = 101; service();
+    assert(tdma_active_mask == 3 && !tdma_staged.valid); /* from empty: immediate */
+    now_ms = 2000; assert(ping(0, true) && ping(1, true) && ping(2, true)); service();
+    now_ms = 2101; service();
+}
+
+static void staged_publication(void)
+{
+    two_member_layout(3, true);
+    uint8_t old_epoch = epoch_of(tracker_slots[0].tdma_config_packed);
+    uint32_t old0 = tracker_slots[0].tdma_config_packed;
+    assert(tdma_staged.valid && tdma_active_mask == 3); /* announced, not applied */
+    assert(tdma_staged.p.new_mask == 7 && tdma_staged.p.epoch == (uint8_t)(old_epoch + 1));
+    assert(tdma_staged.activation_ticks == ticks_at(2101) + k_ms_to_ticks_ceil32(RELAY_LAYOUT_ACTIVATION_MS));
+    assert(tracker_slots[0].tdma_config_packed == old0 && slot(tracker_slots[2].tdma_config_packed) == 0xff);
+    /* Before activation the PONG tuple is the current layout. */
+    uint32_t before = tdma_staged.activation_ticks - 1;
+    assert(tdma_advertised_config(0, before) == old0);
+    assert(slot(tdma_advertised_config(2, before)) == 0xff);
+    /* Serialized: nothing else is published while the stage is pending. */
+    now_ms = 4000; service();
+    assert(tdma_staged.valid && tdma_active_mask == 3);
+    /* At the activation tick PONGs already carry the new tuple and wake the
+     * stats thread, which then applies it. */
+    tdma_membership_wake.count = 0;
+    uint32_t at = tdma_staged.activation_ticks;
+    uint32_t cfg2 = tdma_advertised_config(2, at);
+    assert(slot(cfg2) == 2 && total(cfg2) == 3 && epoch_of(cfg2) == (uint8_t)(old_epoch + 1));
+    assert(tdma_membership_wake.count == 1);
+    now_ms = 2101 + RELAY_LAYOUT_ACTIVATION_MS + 1; service();
+    assert(!tdma_staged.valid && tdma_active_mask == 7);
+    assert(tracker_slots[2].tdma_config_packed == cfg2);
+    assert(tdma_advertised_config(2, ticks_at(now_ms)) == cfg2);
+
+    /* A tracker without staged-activation firmware forces immediate mode. */
+    two_member_layout(3, false);
+    assert(!tdma_staged.valid && tdma_active_mask == 7);
+
+    /* Administrative (forced) recalculation applies a pending stage at once. */
+    two_member_layout(3, true);
+    assert(tdma_staged.valid);
+    force_layout();
+    assert(!tdma_staged.valid && tdma_active_mask == 7);
+    relay_coord_init(&relay_coord);
+    tdma_staged.valid = false;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -532,6 +595,8 @@ int main(int argc, char **argv)
     empty_and_returning();
     owner_store_lock_delay();
     restore_retry();
+    staged_publication();
+    puts("PASS staged layout publication: announce, serialize, activate, legacy and forced");
     puts("Receiver membership admission cases passed");
     return 0;
 }

@@ -12,6 +12,7 @@
 #define ARG_UNUSED(x) ((void)(x))
 #define BIT(n) (1u << (n))
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
+#define MAX(a, b) ((a) > (b) ? (a) : (b))
 #define TEST_ALL_JOIN_CONFIG_GRACE_MS 1500
 #define MAX_TRACKERS 8
 #define K_NO_WAIT 0
