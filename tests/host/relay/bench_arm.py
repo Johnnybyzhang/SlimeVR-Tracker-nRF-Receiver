@@ -115,6 +115,8 @@ def hook_code(uc, address, size, _):
     phases[name] = phases.get(name, 0) + cost
 
 
+disable_stuck = False
+
 def hook_mmio(uc, access, address, size, value, _):
     global disable_ready
     if access == unicorn.UC_MEM_READ and address == 0xe0001004:
@@ -127,7 +129,7 @@ def hook_mmio(uc, access, address, size, value, _):
         # Allow 6 us for radio disable; grant work overlaps this modeled delay.
         disable_ready = cycles + 384 if measuring else 0
     if access == unicorn.UC_MEM_READ and address == 0x40001110 and disable_ready is not None:
-        if cycles >= disable_ready:
+        if not disable_stuck and cycles >= disable_ready:
             write32(address, 1)
             disable_ready = None
 
@@ -243,7 +245,7 @@ int main(int argc, char **argv) {
         if cycles > maximum:
             maximum, worst_seed, worst_phases = cycles, seed, dict(phases)
     # Failures must not steal another owner's radio, or leak our ownership.
-    for failure in ('stale', 'busy', 'not_prx', 'late'):
+    for failure in ('stale', 'busy', 'not_prx', 'late', 'reinit', 'disabled_stuck', 'disabled_late'):
         u.mem_write(0x20000000, initial_ram)
         u.mem_write(0x40000000, initial_peripherals)
         disable_ready = None
@@ -253,7 +255,14 @@ int main(int argc, char **argv) {
         u.mem_write(work, struct.pack('<III3sxI', bench['c'], bench['plan'], wire,
                                      bytes(u.mem_read(bench['crc'], 3)), event))
         busy = sym['radio_operation_busy.lto_priv.0']
-        if failure == 'stale':
+        disable_stuck = failure.startswith('disabled_')
+        if failure == 'reinit':
+            u.mem_write(sym['broadcast_length.lto_priv.0'], b'\0')
+        elif failure == 'disabled_stuck':
+            pass
+        elif failure == 'disabled_late':
+            write32(event, 1)
+        elif failure == 'stale':
             u.mem_write(sym['relay_epoch.lto_priv.0'], b'\x01')
         elif failure == 'busy':
             write32(busy, 1)
@@ -264,7 +273,10 @@ int main(int argc, char **argv) {
         result = call('relay_freeze_arm', bench['rc'], work)
         assert result & 0x80000000, (failure, result)
         assert read32(busy) == (failure == 'busy'), failure
-    print('stale, busy, non-PRX and missed-deadline ownership checks passed')
+        if disable_stuck:
+            assert read32(sym['esb_state.lto_priv.0']) & 255 == 0, failure
+        disable_stuck = False
+    print('stale, busy, non-PRX, reinit, missed deadline and stuck DISABLED ownership checks passed')
     print(f'{args.seeds} linked-firmware DMA payloads match the original policy')
     print(f'freeze-arm helper: max {maximum} modeled cycles, seed {worst_seed}, branch refill +{args.refill}')
     print('phase cycles:', dict(sorted(worst_phases.items(), key=lambda pair: -pair[1])))

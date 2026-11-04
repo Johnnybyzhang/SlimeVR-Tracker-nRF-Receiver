@@ -6,5 +6,5 @@ manifest:
     - name: sdk-nrf
       path: nrf
       url: https://github.com/Johnnybyzhang/sdk-nrf.git
-      revision: esb-prx-broadcast
+      revision: 4b7d847d00508c4e4d821dd283325e70861ca2cb
       import: true

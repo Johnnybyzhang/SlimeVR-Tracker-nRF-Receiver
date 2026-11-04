@@ -55,6 +55,7 @@
 #define RC_MIN_HOLD_MS 5000U
 /* A head must itself be healthy. */
 #define RC_HEAD_MIN_PERMILLE 950U
+_Static_assert(RC_HEAD_MIN_PERMILLE == 950U, "relay qualification threshold");
 #define RC_HEAD_DROP_PERMILLE 850U
 /* Assignment checks: delivery of the trailer, then relay effectiveness. */
 #define RC_DELIVERY_TIMEOUT_MS 3000U
