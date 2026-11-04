@@ -1,3 +1,4 @@
+#include "frame_ledger.h"
 /*
 	SlimeVR Code is placed under the MIT license
 	Copyright (c) 2025 SlimeVR Contributors
@@ -260,6 +261,14 @@ static void print_help(void)
 		"  stats <seconds>            Show detailed stats for N seconds\n"
 		"  resetstats                 Reset packet statistics\n"
 		"\n"
+		"Peer relay:\n"
+		"  relay                      Relay coordinator status\n"
+		"  relay on|off               Enable/disable relaying\n"
+		"  relay v3 on|off            Request/disable the all-v3 profile\n"
+		"  relay pin|unpin <id>       Prefer/stop preferring tracker <id> as a relay head\n"
+		"  relay blockmask <mask> <s> Test: block up to 3 children for at most 60 s\n"
+		"  relay block <id> <pct>     Test: drop pct%% of <id>'s direct uplink (0 = off)\n"
+		"\n"
 	);
 
 	printk(
@@ -360,6 +369,26 @@ static inline void strtolower(char *str)
 	for (int i = 0; str[i] != '\0'; i++) {
 		str[i] = (char)tolower((unsigned char)str[i]);
 	}
+}
+
+/* Console feedback is retained even when ledger event calls compile away. */
+static void console_relay_ledger(const char *text, bool mask)
+{
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+	if (!mask && strcmp(text, "dump") == 0) { ledger_command(-1); return; }
+	char *end;
+	unsigned long value = strtoul(text, &end, 0);
+	if (!*text || *end || value > (mask ? 0x07ffUL : 10UL)) {
+		printk("LEDGER invalid %s\n", mask ? "mask" : "child");
+		return;
+	}
+	if (mask) ledger_command_mask((uint16_t)value);
+	else ledger_command((int)value);
+#else
+	(void)text;
+	(void)mask;
+	printk("ledger unavailable in this image\n");
+#endif
 }
 
 static bool parse_u8_arg(const char *str, uint8_t *value)
@@ -921,6 +950,7 @@ static void console_thread(void)
 	const char command_clear[] = "clear";
 	const char command_stats[] = "stats";
 	const char command_health[] = "health";
+	const char command_relay[] = "relay";
 	const char command_resetstats[] = "resetstats";
 	const char command_channel[] = "channel";
 	const char command_clearchannel[] = "clearchannel";
@@ -1021,6 +1051,47 @@ static void console_thread(void)
 			rcv_cmd_exit_pair();
 		} else if (strcmp(argv[0], command_clear) == 0) {
 			rcv_cmd_clear();
+		} else if (strcmp(argv[0], command_relay) == 0) {
+			uint8_t id = 0, pct = 0;
+			if (argc == 3 && strcmp(arg, "ledgermask") == 0) {
+				console_relay_ledger(arg2, true);
+			} else if (argc == 3 && strcmp(arg, "ledger") == 0) {
+				console_relay_ledger(arg2, false);
+			} else if (argc == 2 && strcmp(arg, "pool") == 0) {
+				esb_relay_print_pool();
+			} else if (argc == 1) {
+				esb_relay_print_status();
+			} else if (argc == 2 && strcmp(arg, "on") == 0) {
+				esb_relay_set_enabled(true);
+				printk("Relay enabled\n");
+			} else if (argc == 2 && strcmp(arg, "off") == 0) {
+				esb_relay_set_enabled(false);
+				printk("Relay disabled\n");
+			} else if (argc == 3 && strcmp(arg, "v3") == 0
+				   && (strcmp(arg2, "on") == 0 || strcmp(arg2, "off") == 0)) {
+				esb_relay_set_v3_enabled(strcmp(arg2, "on") == 0);
+				printk("Relay v3 request %s\n", arg2);
+			} else if (argc == 3 && (strcmp(arg, "pin") == 0 || strcmp(arg, "unpin") == 0)
+				   && parse_u8_arg(arg2, &id) && id < MAX_TRACKERS) {
+				esb_relay_pin(id, strcmp(arg, "pin") == 0);
+				printk("Relay head preference for tracker %u %s\n", id,
+				       strcmp(arg, "pin") == 0 ? "set" : "cleared");
+			} else if (argc == 4 && strcmp(arg, "blockmask") == 0) {
+				char *end;
+				unsigned long mask = strtoul(arg2, &end, 0);
+				if (*arg2 && !*end && mask <= 0x07ff && parse_u8_arg(arg3, &pct) &&
+				    esb_relay_block_mask((uint16_t)mask, pct)) {
+					printk("Direct uplink block mask=0x%04x for %u seconds\n", (unsigned)mask, pct);
+				} else {
+					printk("Usage: relay blockmask <mask: at most 3 children> <seconds: 1..60>\n");
+				}
+			} else if (argc == 4 && strcmp(arg, "block") == 0 && parse_u8_arg(arg2, &id)
+				   && id < MAX_TRACKERS && parse_u8_arg(arg3, &pct) && pct <= 100) {
+				esb_relay_block(id, pct);
+				printk("Direct uplink of tracker %u: %u%% dropped\n", id, pct);
+			} else {
+				printk("Usage: relay [on|off|v3 on|v3 off|pin <id>|unpin <id>|block <id> <pct>]\n");
+			}
 		} else if (strcmp(argv[0], command_health) == 0) {
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 			esb_print_health_snapshot();

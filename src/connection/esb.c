@@ -1,3 +1,4 @@
+#include "frame_ledger.h"
 /*
 	SlimeVR Code is placed under the MIT license
 	Copyright (c) 2025 SlimeVR Contributors
@@ -23,8 +24,10 @@
 #include "esb.h"
 
 #include <errno.h>
+#include <zephyr/random/random.h>
 #include <zephyr/drivers/clock_control/nrf_clock_control.h>
 #include <zephyr/kernel.h>
+#include <zephyr/drivers/timer/nrf_rtc_timer.h>
 #include <zephyr/sys/atomic.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/crc.h>
@@ -39,6 +42,8 @@
 #include "tracker_events.h"
 #include "tracker_event_protocol.h"
 #include "connection/tracker_roster.h"
+#include "connection/relay_protocol.h"
+#include "connection/relay_coord.h"
 
 LOG_MODULE_REGISTER(esb_event, LOG_LEVEL_INF);
 
@@ -221,6 +226,10 @@ static inline uint32_t tdma_pack_config(uint8_t slot, uint8_t total, uint8_t slo
 
 /* Forward declaration — defined after last_ping_time / PING_TIMEOUT_MS */
 static void tdma_recalculate(bool forced);
+/* Peer relay coordinator (see the relay section below). */
+static struct relay_coord relay_coord;
+static bool relay_user_enabled = true;
+static uint16_t relay_forward_published;
 static void tdma_sync_stats_reset(void);
 
 static void tdma_loss_controller_tick(int64_t now);
@@ -435,7 +444,8 @@ static uint16_t test_all_capacity_tps(uint8_t active_count)
 	 * achievable TPS. Test-all forces sticks back to 16 (max rate), but during
 	 * the layout transition the current width is the truth. */
 	uint8_t sticks = tdma_dynamic_slot_ticks > 0 ? tdma_dynamic_slot_ticks : TDMA_BASE_SLOT_TICKS;
-	uint16_t capacity = (uint16_t)(32768U / ((uint32_t)sticks * active_count));
+	uint8_t total_slots = active_count + relay_mask_count(relay_forward_published);
+	uint16_t capacity = (uint16_t)(32768U / ((uint32_t)sticks * total_slots));
 	uint16_t clamped = (capacity / TEST_ALL_RATE_QUANTUM_TPS) * TEST_ALL_RATE_QUANTUM_TPS;
 	return clamped > 0 ? clamped : 1;
 }
@@ -613,6 +623,170 @@ static uint8_t tdma_slot_ticks_for(uint8_t active_count)
 }
 
 
+/* One layout publication: computed by tdma_recalculate(), applied at once
+ * or, for an all-relay-capable fleet, staged until activation_ticks (receiver
+ * ticks, the PONG timestamp clock) so every tracker switches together. See
+ * "Staged layout activation" in relay_protocol.h. */
+struct tdma_publication {
+	uint32_t old_mask;
+	uint32_t new_mask;
+	uint16_t forward_mask;
+	uint8_t active_count;
+	uint8_t forward_count;
+	uint8_t slot_ticks;
+	uint8_t epoch;
+	uint8_t cap_level;
+	bool mask_changed;
+	bool forward_changed;
+	bool test_all_layout;
+	bool ladder_step;
+	uint8_t profile;
+};
+static uint8_t relay_profile;
+static uint32_t relay_origin;
+static uint64_t relay_origin64;
+/* Frame anchor survives profile-1 layout changes that clear current grants. */
+static uint32_t relay_frame_anchor, relay_start_anchor;
+/* Epoch of the active layout; tdma_config_epoch already names a staged one. */
+static uint8_t relay_epoch;
+static uint32_t relay_session;
+static struct relay_control relay_grants;
+static bool relay_repair_delivery;
+static uint32_t relay_learn_lock_max;
+static uint32_t relay_b_sent, relay_b_failed;
+/* B timing, ticks: launch past preamble - TX_OFFSET (count, max), plan and grant work (max). */
+static uint32_t relay_b_late, relay_b_late_max, relay_b_plan_max, relay_b_grant_max;
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+static uint32_t relay_b_arm_cycles_max;
+static uint32_t relay_b_encode_cycles_max;
+#endif
+static uint32_t relay_b_entry_late, relay_b_entry_max;
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+static uint32_t relay_rx_cycles_max, relay_rx_packets;
+static uint64_t relay_rx_cycles_total;
+#endif
+static int relay_b_err;
+static uint32_t relay_direct_start[MAX_TRACKERS];
+static bool relay_direct_pose[MAX_TRACKERS];
+static struct {
+	struct tdma_publication p;
+	uint32_t activation_ticks;
+	bool valid;
+} tdma_staged;
+
+static bool tdma_staged_due_locked(uint32_t now_ticks)
+{
+	return tdma_staged.valid && (int32_t)(now_ticks - tdma_staged.activation_ticks) >= 0;
+}
+
+/* Layout tuple a PONG to `id` carries (ISR or irq_lock): a staged layout
+ * past its activation tick is already the truth for the trackers, even before
+ * the stats thread applies it; wake that thread to do so. */
+static uint32_t tdma_advertised_config(uint8_t id, uint32_t now_ticks)
+{
+	if (!tdma_staged_due_locked(now_ticks) || id >= MAX_TRACKERS) {
+		return id < MAX_TRACKERS ? tracker_slots[id].tdma_config_packed : 0;
+	}
+	const struct tdma_publication *p = &tdma_staged.p;
+	uint8_t assigned = 0xFF;
+	if (p->new_mask & BIT(id)) {
+		assigned = (uint8_t)relay_member_slot((uint16_t)p->new_mask, id);
+	}
+	k_sem_give(&tdma_membership_wake);
+	return tdma_pack_config(assigned, p->active_count + p->forward_count, p->slot_ticks, p->epoch);
+}
+
+/* Every tracker affected by the change runs relay firmware that follows
+ * staged activation (relay_protocol.h); otherwise publish immediately. */
+static bool tdma_staging_supported_locked(uint32_t old_mask, uint32_t new_mask)
+{
+	uint32_t affected = old_mask | new_mask;
+	if (!old_mask || !relay_user_enabled) {
+		return false;
+	}
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		if ((affected & BIT(i)) && !relay_coord_is_capable(&relay_coord, i)) {
+			return false;
+		}
+	}
+	return true;
+}
+
+/* Caller holds irq_lock. */
+static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
+{
+	uint8_t slot = 0;
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		uint8_t assigned = 0xFF;
+		if (p->new_mask & BIT(i)) {
+			assigned = slot++;
+		}
+		tracker_slots[i].tdma_config_packed = tdma_pack_config(
+			assigned, p->active_count + p->forward_count, p->slot_ticks, p->epoch);
+	}
+	relay_forward_published = p->forward_mask;
+	relay_coord_set_forward_layout(&relay_coord, p->forward_mask);
+	if (p->profile && !relay_profile) {
+		relay_origin = tdma_staged.activation_ticks;
+		relay_frame_anchor = 0;
+		relay_start_anchor = relay_origin;
+		uint64_t now = k_uptime_ticks();
+		relay_origin64 = now + (int32_t)(relay_origin - (uint32_t)now);
+	}
+	relay_profile = p->profile;
+	relay_epoch = p->epoch;
+	if (p->profile) {
+		relay_coord_fast_reset(&relay_coord);
+		memset(&relay_grants, 0, sizeof(relay_grants));
+	}
+	tdma_dynamic_active_count = p->active_count;
+	tdma_dynamic_slot_ticks = p->slot_ticks;
+	tdma_active_mask = p->new_mask;
+	if (!atomic_get(&tdma_shadow_pending_join_mask)) {
+		tdma_membership_deadline_armed = false;
+	}
+	if (p->mask_changed || !p->test_all_layout) {
+		tdma_published_cap_level = p->cap_level;
+	}
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	if (p->ladder_step && !p->test_all_layout) {
+		tdma_last_loss_step_ms = now;
+	}
+#else
+	ARG_UNUSED(now);
+#endif
+	esb_auto_loss_invalidate();
+}
+
+/* After irq_unlock: test-all bookkeeping and the log line. */
+static void tdma_apply_finish(const struct tdma_publication *p, int64_t now, bool staged)
+{
+	if (!p->active_count) {
+		return;
+	}
+	test_all_note_layout(p->old_mask, p->new_mask, now);
+	test_all_update_effective(p->active_count, now, true);
+	uint32_t frame_ticks = (uint32_t)p->slot_ticks * (p->active_count + p->forward_count);
+	uint32_t est_tps = 32768 / frame_ticks;
+	LOG_INF(
+		"TDMA reconfig: mode=ping_guard_v2 reason=%s%s active=%u fwd=0x%04x slot=%u frame=%u opportunity=%u/trk aggregate=%u/s cap=%u lvl=%u/%u epoch=%u members=0x%04x",
+		p->mask_changed ? "membership" : (p->forward_changed ? "relay_forward"
+			: (p->test_all_layout ? "test_all" : "loss_ladder")),
+		staged ? " (staged)" : "",
+		p->active_count,
+		p->forward_mask,
+		p->slot_ticks,
+		frame_ticks,
+		est_tps,
+		32768 / p->slot_ticks,
+		tdma_cap_ladder[p->cap_level],
+		p->cap_level,
+		(uint8_t)TDMA_CAP_LEVEL_MAX,
+		p->epoch,
+		p->new_mask
+	);
+}
+
 /* Caller holds tracker_store_lock. Forced administrative cleanup bypasses the
  * ordinary spacing, but only an actual layout change moves its anchor. */
 static void tdma_recalculate(bool forced)
@@ -622,6 +796,19 @@ static void tdma_recalculate(bool forced)
 	for (;;) {
 		unsigned int key = irq_lock();
 		int64_t now = k_uptime_get();
+		/* Transitions are serialized: one staged layout at a time. */
+		if (tdma_staged.valid) {
+			if ((!forced || relay_profile || tdma_staged.p.profile) && !tdma_staged_due_locked((uint32_t)k_uptime_ticks())) {
+				irq_unlock(key);
+				return;
+			}
+			struct tdma_publication due = tdma_staged.p;
+			tdma_staged.valid = false;
+			tdma_apply_locked(&due, now);
+			irq_unlock(key);
+			tdma_apply_finish(&due, now, true);
+			continue;
+		}
 		if (!forced && (diagnostics_reset || atomic_get(&tdma_shadow_pending_join_mask)
 		    || ((uint32_t)atomic_get(&tdma_shadow_desired_mask) & ~tdma_active_mask))) {
 			(void)tdma_shadow_merge_locked((uint32_t)now);
@@ -644,7 +831,17 @@ static void tdma_recalculate(bool forced)
 		} else if (data_collect_is_active() || data_collect_batch_is_active()) {
 			tdma_cap_level = tdma_published_cap_level;
 		}
-		uint8_t slot_ticks = tdma_slot_ticks_for(active_count);
+		/* Relay forwarding slots follow the direct members' slots. They
+		 * count toward the per-tracker rate cap like any other slot. */
+		uint16_t forward_mask = active_count
+			? relay_coord_forward_wanted(&relay_coord, (uint16_t)new_mask) : 0;
+		uint8_t profile = relay_coord_v3_ready(&relay_coord, (uint16_t)new_mask) ? RELAY_PROFILE_120HZ : 0;
+		if (profile) {
+			forward_mask = 0;
+		}
+		uint8_t forward_count = relay_mask_count(forward_mask);
+		bool forward_changed = forward_mask != relay_forward_published;
+		uint8_t slot_ticks = profile ? RELAY_V3_SLOT_TICKS : tdma_slot_ticks_for(active_count + forward_count);
 		bool test_all_layout = atomic_get(&test_all_enabled) != 0;
 		bool ladder_step = tdma_cap_level != tdma_published_cap_level;
 
@@ -655,7 +852,7 @@ static void tdma_recalculate(bool forced)
 			irq_unlock(key);
 			return;
 		}
-		if (!mask_changed && slot_ticks == tdma_dynamic_slot_ticks) {
+		if (!mask_changed && !forward_changed && profile == relay_profile && slot_ticks == tdma_dynamic_slot_ticks) {
 			if (!test_all_layout) {
 				tdma_published_cap_level = tdma_cap_level;
 			}
@@ -685,54 +882,43 @@ static void tdma_recalculate(bool forced)
 		if (active_count) {
 			epoch = ++tdma_config_epoch;
 		}
-		uint8_t slot = 0;
-		for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
-			uint8_t assigned = 0xFF;
-			if (new_mask & BIT(i)) {
-				assigned = slot++;
-			}
-			tracker_slots[i].tdma_config_packed = tdma_pack_config(assigned, active_count, slot_ticks, epoch);
-		}
-		tdma_dynamic_active_count = active_count;
-		tdma_dynamic_slot_ticks = slot_ticks;
-		tdma_active_mask = new_mask;
+		struct tdma_publication pub = {
+			.old_mask = old_mask,
+			.new_mask = new_mask,
+			.forward_mask = forward_mask,
+			.active_count = active_count,
+			.forward_count = forward_count,
+			.slot_ticks = slot_ticks,
+			.epoch = epoch,
+			.cap_level = tdma_cap_level,
+			.mask_changed = mask_changed,
+			.forward_changed = forward_changed,
+			.test_all_layout = test_all_layout,
+			.ladder_step = ladder_step,
+			.profile = profile,
+		};
 		tdma_last_reconfig_time = now;
 		tdma_last_reconfig_valid = true;
-		if (!atomic_get(&tdma_shadow_pending_join_mask)) {
-			tdma_membership_deadline_armed = false;
-		}
-		if (mask_changed || !test_all_layout) {
-			tdma_published_cap_level = tdma_cap_level;
-		}
-#if defined(CONFIG_TDMA_DIAGNOSTICS)
-		if (ladder_step && !test_all_layout) {
-			tdma_last_loss_step_ms = now;
-		}
-#endif
-		esb_auto_loss_invalidate();
-		irq_unlock(key);
-
-		if (!active_count) {
+		if ((!forced || relay_profile || profile) && active_count && tdma_staging_supported_locked(old_mask, new_mask)) {
+			tdma_staged.p = pub;
+			tdma_staged.activation_ticks = (uint32_t)k_uptime_ticks()
+				+ (uint32_t)k_ms_to_ticks_ceil32(RELAY_LAYOUT_ACTIVATION_MS);
+			/* Within a profile the frame grid and B's frame count run on;
+			 * trackers reject B whose frame goes backwards. Activate on a
+			 * 15-frame (4096-tick) boundary of the running grid. */
+			if (relay_profile && profile) {
+				tdma_staged.activation_ticks += 4096U
+					- (tdma_staged.activation_ticks - relay_origin) % 4096U;
+			}
+			tdma_staged.valid = true;
+			irq_unlock(key);
+			LOG_INF("TDMA layout epoch %u staged: activates in %u ms", epoch,
+				(unsigned)RELAY_LAYOUT_ACTIVATION_MS);
 			return;
 		}
-		test_all_note_layout(old_mask, new_mask, now);
-		test_all_update_effective(active_count, now, true);
-		uint32_t frame_ticks = (uint32_t)slot_ticks * active_count;
-		uint32_t est_tps = 32768 / frame_ticks;
-		LOG_INF(
-			"TDMA reconfig: mode=ping_guard_v2 reason=%s active=%u slot=%u frame=%u opportunity=%u/trk aggregate=%u/s cap=%u lvl=%u/%u epoch=%u members=0x%04x",
-			mask_changed ? "membership" : (test_all_layout ? "test_all" : "loss_ladder"),
-			active_count,
-			slot_ticks,
-			frame_ticks,
-			est_tps,
-			32768 / slot_ticks,
-			tdma_cap_ladder[tdma_cap_level],
-			tdma_cap_level,
-			(uint8_t)TDMA_CAP_LEVEL_MAX,
-			epoch,
-			new_mask
-		);
+		tdma_apply_locked(&pub, now);
+		irq_unlock(key);
+		tdma_apply_finish(&pub, now, false);
 		return;
 	}
 }
@@ -977,6 +1163,7 @@ struct tracker_diag {
 static struct tracker_diag tracker_diags[MAX_TRACKERS];
 /* Full slot reset retains its outer IRQ exclusion on the single-core receiver. */
 static struct k_spinlock tdma_timestamp_lock;
+static uint32_t tdma_stats_generation[MAX_TRACKERS];
 
 #endif
 
@@ -984,6 +1171,7 @@ static void tdma_sync_stats_reset(void)
 {
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 	for (uint8_t i = 0; i < MAX_TRACKERS; ++i) {
+		tdma_stats_generation[i]++;
 		memset(&tracker_diags[i].stats, 0, sizeof(tracker_diags[i].stats));
 		tracker_diags[i].g_last_ping_rx_time_diff_valid = false;
 		tracker_diags[i].g_bias_ppb_valid = 0;
@@ -1158,34 +1346,33 @@ static void tdma_loss_controller_tick(int64_t now)
  * @param tracker_id   The tracker's ID (0-15)
  * @param rx_ticks     Receiver time in ticks when packet arrived (EVENT_IRQ fallback)
  */
-static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
+/* SPSC diagnostic ring. The consumer leaves its entry queued while doing
+ * 64-bit drift arithmetic with IRQs enabled. On overflow the ISR consumes the
+ * oldest entry; the worker detects that by sequence and cannot apply it twice. */
+struct tdma_diag_sample {
+	uint32_t ticks, config, ping_ticks, generation;
+	int32_t bias, ppb;
+	uint8_t id, rssi;
+	bool ppb_valid;
+};
+#define TDMA_DIAG_QUEUE_SIZE 64U
+static struct tdma_diag_sample tdma_diag_queue[TDMA_DIAG_QUEUE_SIZE];
+static uint32_t tdma_diag_head, tdma_diag_tail, tdma_diag_overflow;
+
+static void tdma_process_slot(const struct tdma_diag_sample *sample, uint32_t sequence)
 {
-	if (tracker_id >= MAX_TRACKERS) {
-		return;
-	}
-
-	/* Prefer RADIO ISR timestamp (accurate) over EVENT_IRQ timestamp
-	 * (delayed 10-25+ ticks by kernel scheduling).  The ISR timestamp is
-	 * now available for ALL packets including NoACK data, thanks to the
-	 * ESB library patch that always calls on_radio_disabled_rx_dpl(). */
-	k_spinlock_key_t timestamp_key = k_spin_lock(&tdma_timestamp_lock);
-	bool timestamp_valid = tracker_diags[tracker_id].g_last_isr_rx_valid;
-	uint32_t timestamp_ticks = tracker_diags[tracker_id].g_last_isr_rx_ticks;
-	k_spin_unlock(&tdma_timestamp_lock, timestamp_key);
-	if (timestamp_valid) {
-		rx_ticks = timestamp_ticks;
-	}
-
-	/* Read dynamic TDMA config (atomic 32-bit load) */
-	uint32_t cfg = tracker_slots[tracker_id].tdma_config_packed;
+	/* Use the receive-time clock and layout snapshot. */
+	uint8_t tracker_id = sample->id;
+	uint32_t rx_ticks = sample->ticks;
+	int8_t rssi = sample->rssi;
+	bool extrap_skip = false;
+	uint32_t cfg = sample->config;
 	uint8_t expected_slot = (cfg >> 24) & 0xFF;
 	uint8_t total_slots = (cfg >> 16) & 0xFF;
 	uint8_t slot_ticks = (cfg >> 8) & 0xFF;
 
 	/* Skip validation if tracker has no slot assignment or config invalid */
-	if (expected_slot == 0xFF || total_slots == 0 || slot_ticks == 0) {
-		return;
-	}
+	if (expected_slot == 0xFF || total_slots == 0 || slot_ticks == 0) return;
 
 	uint32_t frame_ticks = (uint32_t)slot_ticks * total_slots;
 
@@ -1195,19 +1382,19 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 	 * using the measured drift rate (ppb) to keep it accurate
 	 * between PING sync intervals.
 	 */
-	int32_t clock_bias = tracker_diags[tracker_id].g_last_ping_rx_time_diff_valid ? tracker_diags[tracker_id].g_last_ping_rx_time_diff_ticks : 0;
+	int32_t clock_bias = sample->bias;
 
 	/* Drift extrapolation: bias changes linearly between PINGs.
 	 * Use the long-baseline ppb estimate to correct for drift
 	 * since the last PING, keeping the effective bias accurate
 	 * throughout the sync interval. */
-	if (clock_bias && tracker_diags[tracker_id].g_last_ping_isr_rx_ticks_raw != 0 && tracker_diags[tracker_id].g_bias_ppb_valid) {
-		uint32_t elapsed = rx_ticks - tracker_diags[tracker_id].g_last_ping_isr_rx_ticks_raw;
+	if (clock_bias && sample->ping_ticks != 0 && sample->ppb_valid) {
+		uint32_t elapsed = rx_ticks - sample->ping_ticks;
 		if (elapsed <= TDMA_SYNC_EXTRAP_MAX_TICKS) {
-			int32_t drift_comp = (int32_t)((int64_t)tracker_diags[tracker_id].g_bias_ppb * elapsed / 1000000000LL);
+			int32_t drift_comp = (int32_t)((int64_t)sample->ppb * elapsed / 1000000000LL);
 			clock_bias += drift_comp;
 		} else {
-			tracker_diags[tracker_id].g_extrap_skip_count++;
+			extrap_skip = true;
 		}
 	}
 
@@ -1233,6 +1420,12 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 		ref_offset += frame_ticks;
 	}
 
+	unsigned key = irq_lock();
+	/* Overflow may have consumed this sample while the worker calculated. */
+	if (tdma_diag_tail != sequence) { irq_unlock(key); return; }
+	tdma_diag_tail++;
+	if (sample->generation != tdma_stats_generation[tracker_id]) { irq_unlock(key); return; }
+	tracker_diags[tracker_id].g_extrap_skip_count += extrap_skip;
 	struct tdma_stats *stats = &tracker_diags[tracker_id].stats;
 	stats->count++;
 
@@ -1287,11 +1480,11 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 	 * drift, collisions).
 	 */
 	if (!stats->phase_initialized) {
-		stats->phase_ema_q8 = ref_offset << 8;
+		stats->phase_ema_q8 = ref_offset * 256;
 		stats->phase_initialized = true;
 	} else {
 		/* EMA alpha=1/8: converges in ~8 packets (~50ms at 170 TPS) */
-		stats->phase_ema_q8 += (((ref_offset << 8) - stats->phase_ema_q8) + 4) >> 3;
+		stats->phase_ema_q8 += (((ref_offset * 256) - stats->phase_ema_q8) + 4) >> 3;
 	}
 
 	int32_t phase_mean = stats->phase_ema_q8 >> 8;
@@ -1316,13 +1509,70 @@ static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
 			);
 		}
 	}
+	irq_unlock(key);
 }
+
+static void tdma_deferred_process(void)
+{
+	for (;;) {
+		unsigned key = irq_lock();
+		uint32_t sequence = tdma_diag_tail;
+		if (sequence == tdma_diag_head) { irq_unlock(key); return; }
+		struct tdma_diag_sample sample = tdma_diag_queue[sequence % TDMA_DIAG_QUEUE_SIZE];
+		irq_unlock(key);
+		tdma_process_slot(&sample, sequence);
+	}
+}
+
+static void tdma_check_slot(uint8_t tracker_id, uint32_t rx_ticks, int8_t rssi)
+{
+	if (tracker_id >= MAX_TRACKERS) {
+		return;
+	}
+
+	/* Prefer RADIO ISR timestamp (accurate) over EVENT_IRQ timestamp
+	 * (delayed 10-25+ ticks by kernel scheduling).  The ISR timestamp is
+	 * now available for ALL packets including NoACK data, thanks to the
+	 * ESB library patch that always calls on_radio_disabled_rx_dpl(). */
+	k_spinlock_key_t timestamp_key = k_spin_lock(&tdma_timestamp_lock);
+	bool timestamp_valid = tracker_diags[tracker_id].g_last_isr_rx_valid;
+	uint32_t timestamp_ticks = tracker_diags[tracker_id].g_last_isr_rx_ticks;
+	k_spin_unlock(&tdma_timestamp_lock, timestamp_key);
+	if (timestamp_valid) {
+		rx_ticks = timestamp_ticks;
+	}
+
+	unsigned key = irq_lock();
+	uint32_t cfg = tracker_slots[tracker_id].tdma_config_packed;
+	if ((cfg >> 24) == 0xff || !(cfg & 0xff0000) || !(cfg & 0xff00)) {
+		irq_unlock(key);
+		return;
+	}
+	if (tdma_diag_head - tdma_diag_tail == TDMA_DIAG_QUEUE_SIZE) {
+		struct tdma_diag_sample oldest = tdma_diag_queue[tdma_diag_tail % TDMA_DIAG_QUEUE_SIZE];
+		tdma_process_slot(&oldest, tdma_diag_tail);
+		tdma_diag_overflow++;
+	}
+	tdma_diag_queue[tdma_diag_head % TDMA_DIAG_QUEUE_SIZE] = (struct tdma_diag_sample){
+		.id = tracker_id, .rssi = rssi, .ticks = rx_ticks, .config = cfg,
+		.generation = tdma_stats_generation[tracker_id],
+		.bias = tracker_diags[tracker_id].g_last_ping_rx_time_diff_valid ?
+			tracker_diags[tracker_id].g_last_ping_rx_time_diff_ticks : 0,
+		.ppb = tracker_diags[tracker_id].g_bias_ppb,
+		.ppb_valid = tracker_diags[tracker_id].g_bias_ppb_valid,
+		.ping_ticks = tracker_diags[tracker_id].g_last_ping_isr_rx_ticks_raw,
+	};
+	tdma_diag_head++;
+	irq_unlock(key);
+}
+
 #endif
 
 static void esb_stats_thread(void);
 /* The loss snapshot is inlined into this thread under LTO. TDMA log packaging
  * alone exceeds the former 512-byte stack; leave room for kernel/IRQ frames. */
-K_THREAD_DEFINE(esb_stats_thread_id, 1024, esb_stats_thread, NULL, NULL, NULL, ESB_STATS_THREAD_PRIORITY, 0, 0);
+/* Linked policy + caller use 816 bytes before leaf calls/context saves. */
+K_THREAD_DEFINE(esb_stats_thread_id, 1536, esb_stats_thread, NULL, NULL, NULL, ESB_STATS_THREAD_PRIORITY, 0, 0);
 
 static void esb_thread(void);
 /* LTO startup frames plus transactional roster restore/NVS reads leave only
@@ -1380,6 +1630,39 @@ static inline int esb_find_tracker(uint64_t addr)
 }
 
 
+/* Call with interrupts locked: RX and the monitor share this window. */
+static void packet_stats_refresh(struct packet_stats *stats, uint64_t now)
+{
+	if (!stats->last_tps_time) {
+		stats->last_tps_time = now;
+	} else if (now >= stats->last_tps_time &&
+		   now - stats->last_tps_time >= TPS_CALCULATION_INTERVAL_MS) {
+		stats->current_tps = stats->packets_in_last_second;
+		stats->packets_in_last_second = 0;
+		stats->last_tps_time = now;
+	}
+}
+
+/* TPS and liveness; every accepted pose counts, whichever path delivered it. */
+static void packet_stats_count(struct packet_stats *stats)
+{
+	unsigned key = irq_lock();
+	uint64_t now = k_uptime_get();
+	packet_stats_refresh(stats, now);
+	stats->packets_in_last_second++;
+	stats->last_packet_time = now;
+	irq_unlock(key);
+}
+
+static void packet_stats_monitor(struct packet_stats *stats)
+{
+	unsigned key = irq_lock();
+	/* Sample after taking ownership. A pre-learning timestamp can precede an
+	 * RX rollover and unsigned subtraction would turn it into a huge age. */
+	if (stats->last_tps_time) packet_stats_refresh(stats, k_uptime_get());
+	irq_unlock(key);
+}
+
 static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 {
 	if (tracker_id >= MAX_TRACKERS) {
@@ -1387,21 +1670,7 @@ static int check_packet_sequence(uint8_t tracker_id, uint8_t received_seq)
 	}
 
 	struct packet_stats *stats = &tracker_slots[tracker_id].stats;
-	uint64_t current_time = k_uptime_get();
-	// Update TPS calculation
-	if (stats->last_tps_time == 0) {
-		stats->last_tps_time = current_time;
-		stats->packets_in_last_second = 0;
-	} else if (current_time - stats->last_tps_time >= TPS_CALCULATION_INTERVAL_MS) {
-		// Calculate TPS and reset counter
-		stats->current_tps = stats->packets_in_last_second;
-		stats->packets_in_last_second = 0;
-		stats->last_tps_time = current_time;
-	}
-
-	// Each packet counts towards TPS calculation
-	stats->packets_in_last_second++;
-	stats->last_packet_time = current_time;
+	packet_stats_count(stats);
 
 	// First packet, accept directly
 	if (!tracker_slots[tracker_id].sequence_initialized) {
@@ -1570,6 +1839,48 @@ static void print_tracker_stats_batch(void)
 	}
 }
 
+/* Only the statistics thread calls this. Policy may use a slightly older
+ * observation, but must never publish across a membership/session change. */
+static void relay_learn_update(uint32_t now)
+{
+	static struct relay_coord snapshot;
+	unsigned key = irq_lock();
+	uint32_t session = relay_session;
+	uint8_t epoch = relay_epoch;
+	uint16_t members = (uint16_t)tdma_active_mask;
+	irq_unlock(key);
+	/* Recheck live timestamps under a per-cell lock. A report newer than
+	 * this pass's timestamp is fresh, including across clock rollover. */
+	for (unsigned h = 0; h < RC_MAX; h++) {
+		for (unsigned c = 0; c < RC_MAX; c++) {
+			key = irq_lock();
+			uint32_t start = k_cycle_get_32();
+			relay_coord_expire_peer(&relay_coord, h, c, now);
+			relay_learn_lock_max = MAX(relay_learn_lock_max, k_cycle_get_32() - start);
+			irq_unlock(key);
+		}
+	}
+	for (unsigned i = 0; i < RC_MAX; i++) {
+		key = irq_lock();
+		uint32_t start = k_cycle_get_32();
+		snapshot.t[i] = relay_coord.t[i];
+		memcpy(snapshot.peer[i], relay_coord.peer[i], sizeof(snapshot.peer[i]));
+		memcpy(snapshot.choice[i], relay_coord.choice[i], sizeof(snapshot.choice[i]));
+		relay_learn_lock_max = MAX(relay_learn_lock_max, k_cycle_get_32() - start);
+		irq_unlock(key);
+	}
+	snapshot.learn_members = members;
+	relay_coord_learn_tick(&snapshot, now);
+	key = irq_lock();
+	uint32_t start = k_cycle_get_32();
+	if (session == relay_session && epoch == relay_epoch && members == tdma_active_mask) {
+		memcpy(relay_coord.choice, snapshot.choice, sizeof(relay_coord.choice));
+		relay_coord.learn_members = members;
+	}
+	relay_learn_lock_max = MAX(relay_learn_lock_max, k_cycle_get_32() - start);
+	irq_unlock(key);
+}
+
 static void esb_stats_thread(void)
 {
 	last_tps_print_time = k_uptime_get();
@@ -1592,21 +1903,25 @@ static void esb_stats_thread(void)
 		}
 		next_monitor_time = (int64_t)now + TPS_MONITOR_INTERVAL_MS;
 
-		// Update TPS for each tracker
+		/* Relay decisions every window, before the layout pass below picks
+		 * up any change in forwarding slots. OTA runs on direct links only,
+		 * so the coordinator pauses (and releases every role) meanwhile. */
+		{
+			bool relay_enabled = relay_user_enabled && !esb_ota_relay_is_active();
+			unsigned int relay_key = irq_lock();
+			if (relay_enabled != relay_coord.enabled) {
+				relay_coord_set_enabled(&relay_coord, relay_enabled);
+			}
+			(void)relay_coord_tick(&relay_coord, (uint16_t)tdma_active_mask, k_uptime_get_32());
+			irq_unlock(relay_key);
+		}
+
+		/* Proof can invalidate both incumbents in this 500 ms window.
+		 * Refill choices now, not at the next one-second TPS report. */
+		relay_learn_update(k_uptime_get_32());
+
 		for (int i = 0; i < MAX_TRACKERS; i++) {
-			struct packet_stats *stats = &tracker_slots[i].stats;
-			if (stats->last_tps_time == 0) {
-				continue;
-			}
-			if (now - stats->last_tps_time >= TPS_CALCULATION_INTERVAL_MS) {
-				if (stats->packets_in_last_second > 0) {
-					stats->current_tps = stats->packets_in_last_second;
-				} else if (stats->last_packet_time && now - stats->last_packet_time >= TPS_CALCULATION_INTERVAL_MS) {
-					stats->current_tps = 0;
-				}
-				stats->packets_in_last_second = 0;
-				stats->last_tps_time = now;
-			}
+			packet_stats_monitor(&tracker_slots[i].stats);
 		}
 
 		// Check if detailed stats should be auto-disabled
@@ -1788,6 +2103,166 @@ static void raw_arq_reset(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Peer relay (relay_protocol.h, relay_coord.h). The coordinator state is
+ * touched from the RADIO ISR (ACK handler), the ESB event ISR and the stats
+ * thread; every access holds irq_lock.
+ * ------------------------------------------------------------------------- */
+/* Test hook: deterministic loss of a tracker's direct uplink (pose frames,
+ * bundles and PINGs), as if obstructed, while peers still hear it. */
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+/* Background reservation/validated-packet counters, never in freeze encoding. */
+static uint32_t relay_pool_reserved[RELAY_V3_REPAIR_SLOTS][4]; /* repair/report/maintenance/idle */
+static uint32_t relay_pool_received[RELAY_V3_REPAIR_SLOTS];
+#endif
+static uint8_t relay_block_id = 0xFF;
+static uint8_t relay_block_percent;
+static uint16_t relay_block_mask;
+static uint32_t relay_block_deadline;
+static struct {
+	uint32_t bundles;
+	uint32_t bundle_invalid;
+	uint32_t records;
+	uint32_t records_accepted;
+	uint32_t direct_accepted;
+	uint32_t duplicate_pose;
+	uint32_t blocked;
+	/* Cumulative repair funnel and delivery age, sampled by the relay console. */
+	struct {
+		uint32_t seen, invalid, phase, slot, record;
+		uint32_t received[RC_MAX], duplicate[RC_MAX], obsolete[RC_MAX], age[RC_MAX][RELAY_V3_CACHE_FRAMES];
+	} repair;
+} relay_rx_stats;
+/* Latest private diagnostic frame per tracker (RELAY_DIAG_*), console only. */
+static struct {
+	uint8_t data[RELAY_DIAG_LEN];
+	uint32_t rx_ms;
+	bool valid;
+} relay_diag[MAX_TRACKERS];
+
+static void esb_receive_relay_diag(const struct esb_payload *payload)
+{
+	uint8_t id = payload->data[1];
+	if (payload->length != RELAY_DIAG_LEN || id >= stored_trackers || id >= MAX_TRACKERS
+	    || payload->pipe != 1 + (id % 7)) {
+		return;
+	}
+	memcpy(relay_diag[id].data, payload->data, RELAY_DIAG_LEN);
+	relay_diag[id].rx_ms = k_uptime_get_32();
+	relay_diag[id].valid = true;
+}
+
+static int relay_coord_init_once(void)
+{
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+#endif
+	relay_coord_init(&relay_coord);
+	return 0;
+}
+SYS_INIT(relay_coord_init_once, APPLICATION, 0);
+
+static int composite_body_length(uint8_t type);
+
+/* Conservative fast validation. Unusual/event composites stay on the full
+ * event path; only a completely known record list may suppress B early. */
+static bool relay_early_receipt_valid(const uint8_t *data, uint8_t length)
+{
+	if (data[0] != ESB_COMPOSITE_TYPE) return length == 17 && data[0] < 0x10;
+	if (length < 5 || !data[2]) return false;
+	unsigned pos = 3;
+	for (unsigned i = 0; i < data[2]; i++) {
+		if (pos >= length - 1U) return false;
+		uint8_t type = data[pos++];
+		if (type > 5) return false;
+		int n = composite_body_length(type);
+		if (n < 0 || pos + n > length - 1U) return false;
+		pos += n;
+	}
+	return pos == length - 1U;
+}
+
+/* Multi-child injection expires without relying on the console client. */
+static bool relay_multi_blocked(uint8_t id)
+{
+	return id < RC_MAX && (relay_block_mask & BIT(id)) &&
+		(int32_t)(relay_block_deadline - k_uptime_get_32()) > 0;
+}
+
+static bool relay_block_drop(uint8_t id, uint8_t salt)
+{
+	bool multi = relay_multi_blocked(id);
+	if (!multi && (id != relay_block_id || relay_block_percent == 0)) {
+		return false;
+	}
+	uint32_t h = ((uint32_t)salt * 2654435761U) ^ ((uint32_t)id * 40503U);
+	h ^= h >> 15;
+	h *= 2246822519U;
+	h ^= h >> 13;
+	bool drop = multi || h % 100U < relay_block_percent;
+	if (drop) {
+		relay_rx_stats.blocked++;
+	}
+	return drop;
+}
+
+/* Sequence check plus relay accounting: gaps revealed, path, RSSI. */
+static int relay_sequence_check(uint8_t id, uint8_t seq, bool relayed, uint8_t rssi)
+{
+	if (relay_repair_delivery) {
+		packet_stats_count(&tracker_slots[id].stats);
+		return RC_SEQ_NORMAL;
+	}
+	if (relay_profile && !relayed && !relay_direct_pose[id]) {
+		return RC_SEQ_OLD;
+	}
+	if (relay_profile && relay_direct_pose[id] && !relayed) {
+		uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
+		int slot = relay_member_slot((uint16_t)tdma_active_mask, id);
+		uint32_t phase = relay_direct_start[id] - relay_frame_start(relay_origin, frame);
+		if (slot < 0 || phase / RELAY_V3_SLOT_TICKS != (uint32_t)slot) {
+			return RC_SEQ_OLD;
+		}
+
+		relay_coord_note_frame(&relay_coord, id, RC_DIRECT, RC_SEQ_NORMAL, 0, rssi,
+				       k_uptime_get_32());
+		if (!relay_coord_publish(&relay_coord, id, frame)) {
+			return RC_SEQ_DUP;
+		}
+		packet_stats_count(&tracker_slots[id].stats);
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+		ledger_note(relay_session, frame, id, LEDGER_ACCEPT, -(int16_t)rssi, 255, 0);
+#endif
+		relay_rx_stats.direct_accepted++;
+		return RC_SEQ_NORMAL;
+	}
+	uint32_t gaps_before = tracker_slots[id].stats.total_gaps;
+	int result = check_packet_sequence(id, seq);
+	uint32_t gaps = tracker_slots[id].stats.total_gaps - gaps_before;
+	unsigned int key = irq_lock();
+	relay_coord_note_frame(&relay_coord, id, relayed ? RC_RELAYED : RC_DIRECT, result,
+		(uint8_t)MIN(gaps, 255U), rssi, k_uptime_get_32());
+	relay_rx_stats.direct_accepted += !relayed && result != 2 && result != 4;
+	relay_rx_stats.duplicate_pose += result == 4;
+	if (relayed && result != 2 && result != 4) {
+		relay_rx_stats.records_accepted++;
+	}
+	irq_unlock(key);
+	return result;
+}
+
+/* The info frame's reserved byte carries relay capability; HID gets the
+ * stock zero so an unmodified server sees an unchanged packet. */
+static void relay_take_caps(uint8_t id, uint8_t *info16)
+{
+	uint8_t caps = info16[RELAY_INFO_CAPS_INDEX];
+	info16[RELAY_INFO_CAPS_INDEX] = 0;
+	unsigned int key = irq_lock();
+	relay_coord_note_caps(&relay_coord, id, caps);
+	irq_unlock(key);
+}
+
+/* ---------------------------------------------------------------------------
  * ACK handler — runs in radio ISR context (~130 µs budget).
  * Builds the ACK payload for the *current* packet so the response is
  * returned in the same transaction rather than the next one.
@@ -1875,6 +2350,39 @@ static void esb_ack_handler_cb(
 		return;
 	}
 
+	if (relay_profile && data_length > 1 && pdu_data[1] < MAX_TRACKERS && pipe_id > 0) {
+		uint8_t id = pdu_data[1];
+		/* Judge the slot by where the frame started: a 60-byte composite
+		 * ends close enough to the slot edge that its END can land in the
+		 * next slot. */
+		relay_direct_start[id] = (uint32_t)k_uptime_ticks() - RELAY_V3_AIR_TICKS(data_length);
+		int slot = relay_member_slot((uint16_t)tdma_active_mask, id);
+		relay_direct_pose[id] = pipe_id == 1U + id % 7U && slot >= 0
+			&& data_length <= relay_direct_payload_max(relay_profile, (uint8_t)slot)
+			&& relay_frame_is_pose(pdu_data, data_length, id);
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+		/* Observe RF arrival without publishing a forced-dropped frame. The
+		 * phase is an ISR-time estimate of its preamble, not a receipt bit. */
+		if (relay_direct_pose[id] && ledger_child_enabled(id)) {
+			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
+			uint32_t slot_start = relay_frame_start(relay_origin, frame) + slot * RELAY_V3_SLOT_TICKS;
+			ledger_note(relay_session, frame, id, LEDGER_DIRECT_SEEN,
+				(int32_t)(relay_direct_start[id] - slot_start), 255, 0);
+		}
+#endif
+		/* B can preempt the deferred RX event after D10 has reached the
+		 * radio. Freeze RF receipt here; publication keeps its own watermark.
+		 * A configured drop must still be announced as missing. */
+		if (relay_direct_pose[id] && id < stored_trackers
+		    && !relay_multi_blocked(id) && (id != relay_block_id || !relay_block_percent)
+		    && relay_early_receipt_valid(pdu_data, data_length)) {
+			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
+			uint32_t phase = relay_direct_start[id] - relay_frame_start(relay_origin, frame);
+			if (phase / RELAY_V3_SLOT_TICKS == (uint32_t)slot) {
+				relay_coord_receive(&relay_coord, id, frame);
+			}
+		}
+	}
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 	/* ---- Capture ISR timestamp for any tracker packet (non-pairing) ---- */
 	if (data_length > 1 && pipe_id > 0) {
@@ -1901,6 +2409,11 @@ static void esb_ack_handler_cb(
 			return;
 		}
 		uint8_t counter = pdu_data[2];
+		/* Test hook: an obstructed uplink loses the PING, so no PONG. */
+		if (relay_block_drop(tracker_id, counter ^ 0xA5U)) {
+			*suppress_ack = true;
+			return;
+		}
 		bool channel_confirm = (pdu_data[7] & ESB_PING_FLAG_CHANNEL_CONFIRM) != 0;
 		uint32_t rx_ticks = k_uptime_ticks();
 		uint8_t cmd = ESB_PONG_FLAG_CHANNEL_CONFIRM;
@@ -2035,8 +2548,9 @@ static void esb_ack_handler_cb(
 				ack_payload->data[10] = 0;
 				ack_payload->data[11] = 0;
 			} else if (cmd == ESB_PONG_FLAG_NORMAL) {
-				/* Preserve the legacy TDMA tuple byte for byte. */
-				uint32_t cfg = tracker_slots[tracker_id].tdma_config_packed;
+				/* Preserve the legacy TDMA tuple byte for byte: the active
+				 * layout, or a staged one whose activation tick has passed. */
+				uint32_t cfg = tdma_advertised_config(tracker_id, rx_ticks);
 				ack_payload->data[8] = (cfg >> 24) & 0xFF;
 				ack_payload->data[9] = (cfg >> 16) & 0xFF;
 				ack_payload->data[10] = (cfg >> 8) & 0xFF;
@@ -2048,6 +2562,50 @@ static void esb_ack_handler_cb(
 
 		ack_payload->data[ESB_PONG_LEN - 1] = crc8_ccitt(0x07, ack_payload->data, ESB_PONG_LEN - 1);
 		*has_ack_payload = true;
+
+		/* Relay-capable trackers get the trailer: head assignment, forwarding
+		 * slot, member mask and relayed mask, all for the layout whose epoch
+		 * the legacy tuple of a NORMAL PONG carries. Others keep 13 bytes. */
+		if (relay_coord_is_capable(&relay_coord, tracker_id)) {
+			struct relay_pong_trailer trailer;
+			/* Judged at the PONG timestamp, like the tuple. */
+			bool due = tdma_staged_due_locked(rx_ticks);
+			uint8_t epoch = (uint8_t)(tdma_advertised_config(tracker_id, rx_ticks) & 0xFFU);
+			uint16_t members = (uint16_t)(due ? tdma_staged.p.new_mask : tdma_active_mask);
+			relay_coord_trailer(&relay_coord, tracker_id, epoch, members, &trailer);
+			trailer.pending = false;
+			/* Announce a staged layout on NORMAL PONGs, whose bytes 3..6
+			 * carry the receiver timestamp the activation is relative to. */
+			if (tdma_staged.valid && !due && ack_payload->data[7] == ESB_PONG_FLAG_NORMAL) {
+				uint32_t lead = tdma_staged.activation_ticks - rx_ticks;
+				trailer.pending = (int32_t)lead > 0;
+				trailer.pending_epoch = tdma_staged.p.epoch;
+				trailer.pending_total = tdma_staged.p.profile ? (0x80U | tdma_staged.p.profile)
+					: tdma_staged.p.active_count + tdma_staged.p.forward_count;
+				trailer.pending_slot_ticks = tdma_staged.p.slot_ticks;
+				trailer.pending_member_mask = (uint16_t)tdma_staged.p.new_mask;
+				trailer.activation_units = (uint16_t)MIN(
+					(lead + RELAY_ACTIVATION_UNIT_TICKS - 1U) / RELAY_ACTIVATION_UNIT_TICKS, UINT16_MAX);
+			} else if (relay_profile && !tdma_staged.valid && ack_payload->data[7] == ESB_PONG_FLAG_NORMAL) {
+				/* The legacy tuple cannot say profile 1, so a tracker joining a
+				 * running profile learns it as a layout activating on the next
+				 * 15-frame boundary (exactly 4096 ticks); B then anchors it. */
+				uint32_t lead = 4096U - (rx_ticks - relay_origin) % 4096U;
+				trailer.pending = true;
+				trailer.pending_epoch = epoch;
+				trailer.pending_total = 0x80U | relay_profile;
+				trailer.pending_slot_ticks = RELAY_V3_SLOT_TICKS;
+				trailer.pending_member_mask = members;
+				trailer.activation_units = (uint16_t)((lead + RELAY_ACTIVATION_UNIT_TICKS - 1U)
+					/ RELAY_ACTIVATION_UNIT_TICKS);
+			}
+			ack_payload->length = (uint8_t)(ESB_PONG_LEN
+				+ relay_trailer_encode(&ack_payload->data[ESB_PONG_LEN], &trailer));
+			if (trailer.children_mask) {
+				relay_coord_note_trailer_sent(&relay_coord, tracker_id, trailer.children_mask,
+					k_uptime_get_32());
+			}
+		}
 
 		/* Preserve the ordinary PONG counter and clock stamp on cancellation. */
 		if (ota_aborting) {
@@ -2066,7 +2624,8 @@ static void esb_ack_handler_cb(
 		}
 		/* Arm only the final selected request, never a PONG replaced by OTA.
 		 * The incoming PING predates this ACK and cannot confirm it. */
-		if (*has_ack_payload && ack_payload->length == ESB_PONG_LEN &&
+		if (*has_ack_payload &&
+		    (ack_payload->length == ESB_PONG_LEN || relay_pong_is_extended(ack_payload->length)) &&
 		    ack_payload->data[0] == ESB_PONG_TYPE &&
 		    ack_payload->data[7] == ESB_PONG_FLAG_WOM_CONTROL &&
 		    tracker_slots[tracker_id].tracker_remote_command == ESB_PONG_FLAG_WOM_CONTROL &&
@@ -2499,24 +3058,130 @@ static void esb_receive_ping(const struct esb_payload *payload, uint32_t event_t
 	tracker_slots[tracker_id].last_pong_queued_counter = counter;
 }
 
-static void esb_receive_composite(const struct esb_payload *payload, uint32_t event_ticks)
-{
-	/* Composite packet (type ESB_COMPOSITE_TYPE): variable length.
-	 * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub_type0][sub_data0...]...[sequence]
-	 * Each sub-packet: 1 byte type + variable data.
-	 */
-	if (payload->length < 5 || payload->data[0] != ESB_COMPOSITE_TYPE) {
-		LOG_ERR("Wrong packet length: %d", payload->length);
-		return;
-	}
+/* Learning does not affect receipt/deduplication evidence at the freeze.
+ * Copy the grant with reports: a queued report must use its receive-time grant. */
+struct relay_learning_record {
+	struct relay_control grant;
+	struct relay_peer_report report;
+	uint32_t now;
+	uint8_t helper, child, rssi, slot;
+	bool is_report;
+};
+K_MSGQ_DEFINE(relay_learning_queue, sizeof(struct relay_learning_record), 16, 4);
+static uint32_t relay_learning_overflow;
 
+static void relay_learning_apply(const struct relay_learning_record *r)
+{
+	unsigned key = irq_lock();
+	if (r->grant.session == relay_session && r->grant.epoch == relay_epoch) {
+		if (r->is_report) {
+			(void)relay_coord_report(&relay_coord, &r->grant, r->slot, &r->report, r->now);
+		} else {
+			relay_coord_capture(&relay_coord, r->helper, r->child, r->rssi, r->now);
+		}
+	}
+	irq_unlock(key);
+}
+
+static void relay_learning_submit(const struct relay_learning_record *r)
+{
+	if (k_msgq_put(&relay_learning_queue, r, K_NO_WAIT)) {
+		/* Preserve ordering and evidence under overload; expose the slow fallback. */
+		struct relay_learning_record pending;
+		while (!k_msgq_get(&relay_learning_queue, &pending, K_NO_WAIT)) {
+			relay_learning_apply(&pending);
+		}
+		relay_learning_overflow++;
+		relay_learning_apply(r);
+	}
+}
+
+static void relay_defer_capture(struct relay_coord *rc, uint8_t helper, uint8_t child,
+	uint8_t rssi, uint32_t now)
+{
+	ARG_UNUSED(rc);
+	struct relay_learning_record r = {.grant = {.session = relay_session, .epoch = relay_epoch},
+		.helper = helper, .child = child, .rssi = rssi, .now = now};
+	relay_learning_submit(&r);
+}
+
+static bool relay_defer_report(struct relay_coord *rc, const struct relay_control *grant,
+	unsigned slot, const struct relay_peer_report *report, uint32_t now)
+{
+	ARG_UNUSED(rc);
+	struct relay_learning_record r = {.grant = *grant, .report = *report,
+		.slot = slot, .now = now, .is_report = true};
+	relay_learning_submit(&r);
+	return true;
+}
+
+static void relay_learning_thread(void)
+{
+	struct relay_learning_record r;
+	for (;;) {
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+		tdma_deferred_process();
+#endif
+		/* Dequeue and apply atomically with respect to the overflow fallback. */
+		unsigned key = irq_lock();
+		int err = k_msgq_get(&relay_learning_queue, &r, K_NO_WAIT);
+		if (!err) relay_learning_apply(&r);
+		irq_unlock(key);
+		if (err) k_usleep(200);
+	}
+}
+K_THREAD_DEFINE(relay_learning_thread_id, 1536, relay_learning_thread, NULL, NULL, NULL, 3, 0, 0);
+
+/* Copy accepted output records; timestamp, sequence and freeze evidence stay
+ * in the ISR. 128 records cover >40 ms at three records per pose at 1300 Hz. */
+struct relay_hid_record {
+	uint8_t data[16];
+	uint8_t rssi;
+};
+K_MSGQ_DEFINE(relay_hid_queue, sizeof(struct relay_hid_record), 128, 4);
+static uint32_t relay_hid_overflow;
+
+static void relay_hid_packet(const uint8_t *data, uint8_t rssi)
+{
+	struct relay_hid_record record = {.rssi = rssi};
+	memcpy(record.data, data, sizeof(record.data));
+	if (k_msgq_put(&relay_hid_queue, &record, K_NO_WAIT)) {
+		/* Backpressure must not silently drop an accepted pose. */
+		struct relay_hid_record pending;
+		while (!k_msgq_get(&relay_hid_queue, &pending, K_NO_WAIT)) {
+			hid_write_packet_n(pending.data, pending.rssi);
+		}
+		relay_hid_overflow++;
+		hid_write_packet_n(record.data, record.rssi);
+	}
+}
+
+static void relay_hid_thread(void)
+{
+	struct relay_hid_record record;
+	for (;;) {
+		unsigned key = irq_lock();
+		int err = k_msgq_get(&relay_hid_queue, &record, K_NO_WAIT);
+		if (!err) hid_write_packet_n(record.data, record.rssi);
+		irq_unlock(key);
+		if (err) k_usleep(200);
+	}
+}
+K_THREAD_DEFINE(relay_hid_thread_id, 768, relay_hid_thread, NULL, NULL, NULL, 3, 0, 0);
+
+struct composite_result {
+	uint8_t sub_count;
+	int event_pos;
+	bool business;
+};
+
+/* Full validation is deliberately distinct from conservative early receipts. */
+static bool composite_validate(const struct esb_payload *payload, struct composite_result *out)
+{
+	if (payload->length < 5 || payload->data[0] != ESB_COMPOSITE_TYPE) return false;
 	uint8_t tracker_id = payload->data[1];
 	uint8_t sub_count = payload->data[2];
-
-	if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
-		return;
-	}
-
+	bool business = false;
 	/* Validate known records before side effects. Unknown legacy tails
 	 * stop parsing, preserving the known prefix and pose accounting.
 	 * A reachable E0 must still be a valid, exact final record. */
@@ -2547,11 +3212,39 @@ static void esb_receive_composite(const struct esb_payload *payload, uint32_t ev
 				                            body_len, &decoded);
 			event_pos = scan;
 		}
+		if (type != TRACKER_EVENT_ESB_TYPE) business = true;
 		scan += body_len;
 	}
 	if (!valid || (!unknown_tail && scan != frame_end)) {
+		return false;
+	}
+	*out = (struct composite_result){sub_count, event_pos, business};
+	return true;
+}
+
+static void esb_execute_composite(struct esb_payload *payload, uint32_t event_ticks, bool relayed,
+                                  const struct composite_result *validated)
+{
+	/* Composite packet (type ESB_COMPOSITE_TYPE): variable length.
+	 * Format: [ESB_COMPOSITE_TYPE][tracker_id][sub_count][sub_type0][sub_data0...]...[sequence]
+	 * Each sub-packet: 1 byte type + variable data.
+	 */
+	if (payload->length < 5 || payload->data[0] != ESB_COMPOSITE_TYPE) {
+		LOG_ERR("Wrong packet length: %d", payload->length);
 		return;
 	}
+
+	uint8_t tracker_id = payload->data[1];
+	uint8_t sub_count = validated->sub_count;
+
+	if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
+		return;
+	}
+	if (!relayed && relay_block_drop(tracker_id, payload->data[payload->length - 1])) {
+		return;
+	}
+
+	int event_pos = validated->event_pos;
 	if (event_pos != 0) {
 		uint8_t event_packet[TRACKER_EVENT_ESB_LEN] = {
 			TRACKER_EVENT_ESB_TYPE, tracker_id
@@ -2564,7 +3257,9 @@ static void esb_receive_composite(const struct esb_payload *payload, uint32_t ev
 		}
 	}
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
-	tdma_check_slot(tracker_id, event_ticks, payload->rssi);
+	if (!relayed) {
+		tdma_check_slot(tracker_id, event_ticks, payload->rssi);
+	}
 #else
 	ARG_UNUSED(event_ticks);
 #endif
@@ -2573,7 +3268,7 @@ static void esb_receive_composite(const struct esb_payload *payload, uint32_t ev
 
 	/* Sequence byte is at the very end of the composite packet */
 	uint8_t received_sequence = payload->data[payload->length - 1];
-	int seq_result = check_packet_sequence(tracker_id, received_sequence);
+	int seq_result = relay_sequence_check(tracker_id, received_sequence, relayed, (uint8_t)payload->rssi);
 	if (payload->pipe == 1 + (tracker_id % 7)) {
 		tdma_shadow_observe(tracker_id, TDMA_SHADOW_EVIDENCE_DATA);
 	}
@@ -2626,12 +3321,277 @@ static void esb_receive_composite(const struct esb_payload *payload, uint32_t ev
 			stats->status_received = 0;
 			stats->status_lost = 0;
 		}
+		if (sub_type == 0) {
+			relay_take_caps(tracker_id, pkt);
+		}
 
-		hid_write_packet_n(pkt, payload->rssi);
+		relay_hid_packet(pkt, payload->rssi);
 		pos += sub_len;
 	}
 }
 
+static void esb_receive_composite(struct esb_payload *payload, uint32_t event_ticks, bool relayed)
+{
+	if (payload->length < 5 || payload->data[0] != ESB_COMPOSITE_TYPE) {
+		LOG_ERR("Wrong packet length: %d", payload->length);
+		return;
+	}
+	struct composite_result validated;
+	if (composite_validate(payload, &validated)) {
+		esb_execute_composite(payload, event_ticks, relayed, &validated);
+	}
+}
+
+/* One 17-byte pose frame, received directly or extracted from a relay bundle.
+ * Relayed frames skip the slot-timing diagnostic (they arrive in the head's
+ * slot) and are otherwise processed exactly like direct ones, so HID output
+ * is byte-identical. */
+static void esb_receive_normal(struct esb_payload *payload, uint32_t event_ticks, bool relayed)
+{
+	if (payload->data[0] > 223) {
+		return;
+	}
+	uint8_t tracker_id = payload->data[1];
+
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	// TDMA Slot Check for Data (Type 17)
+	if (!relayed) {
+		tdma_check_slot(tracker_id, event_ticks, payload->rssi);
+	}
+#else
+	ARG_UNUSED(event_ticks);
+#endif
+
+	if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
+		return;
+	}
+
+	uint8_t received_sequence = payload->data[16];
+	if (!relayed && relay_block_drop(tracker_id, received_sequence)) {
+		return;
+	}
+	int seq_result = relay_sequence_check(tracker_id, received_sequence, relayed, (uint8_t)payload->rssi);
+	if (payload->pipe == 1 + (tracker_id % 7)) {
+		tdma_shadow_observe(tracker_id, TDMA_SHADOW_EVIDENCE_DATA);
+	}
+	// Decide whether to forward the packet based on the sequence check result
+	// seq_result: 0=normal, 1=potential loss, 2=out of order, 3=reboot, 4=duplicate
+	if (seq_result == 4) {
+		LOG_DBG("TRK %d: Duplicate packet seq=%d, dropped", tracker_id, received_sequence);
+		// Drop duplicate packet
+		return;
+	}
+	if (seq_result == 2) {
+		LOG_DBG("TRK %d: Out-of-order packet seq=%d, dropped", tracker_id, received_sequence);
+		// Drop out-of-order packet to avoid incorrect pose calculation
+		return;
+	}
+
+	if (seq_result == 3 && atomic_get(&test_all_state_valid)) {
+		/* Quick reboot with ambiguous PING counter: drop the
+		 * sticky confirmation and re-arm the grace. The pending
+		 * command itself is left alone — ACK PONGs are PING-
+		 * driven; the PING restart/timeout path parks the flag
+		 * before the next ACK. */
+		atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(tracker_id));
+		atomic_set(
+			&test_all_ready_after_ms[tracker_id],
+			(atomic_val_t)((uint32_t)k_uptime_get() + TEST_ALL_JOIN_CONFIG_GRACE_MS)
+		);
+	}
+
+	// Forward packet for other cases (normal, potential loss, reboot)
+	// For status packets (type 3), fill in packet loss statistics before forwarding
+	if (payload->data[0] == 3) {
+		struct packet_stats *stats = &tracker_slots[tracker_id].stats;
+		payload->data[4] = stats->status_received;
+		payload->data[5] = stats->status_lost;
+		payload->data[6] = 0; // windows_hit (not implemented)
+		payload->data[7] = 0; // windows_missed (not implemented)
+		stats->status_received = 0;
+		stats->status_lost = 0;
+	}
+	if (payload->data[0] == 0) {
+		relay_take_caps(tracker_id, payload->data);
+	}
+	relay_hid_packet(payload->data,
+					   payload->rssi); // write to hid endpoint
+}
+
+static void esb_receive_peer_report(const struct esb_payload *payload, uint32_t event_ticks)
+{
+	struct relay_peer_report report;
+	if (!relay_profile || !relay_peer_report_decode(payload->data, payload->length, &report) ||
+	    payload->pipe != 1U + report.helper % 7U) {
+		return;
+	}
+	uint32_t preamble = event_ticks - RELAY_V3_AIR_TICKS(payload->length);
+	uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, preamble);
+	uint32_t phase = preamble - relay_frame_start(relay_origin, frame);
+	if (frame != relay_grants.frame || phase < RELAY_V3_REPAIR_START) {
+		return;
+	}
+	unsigned slot = (phase - RELAY_V3_REPAIR_START) / RELAY_V3_SLOT_TICKS;
+	(void)relay_defer_report(&relay_coord, &relay_grants, slot, &report, k_uptime_get_32());
+}
+
+static void esb_receive_repair(const struct esb_payload *payload, uint32_t event_ticks)
+{
+	struct relay_repair repair;
+	relay_rx_stats.repair.seen++;
+	if (!relay_profile || !relay_repair_decode(payload->data, payload->length, &repair) ||
+	    repair.session != relay_session || repair.epoch != relay_grants.epoch ||
+	    payload->pipe != 1U + repair.helper % 7U) {
+		relay_rx_stats.repair.invalid++;
+		return;
+	}
+	uint32_t preamble = event_ticks - RELAY_V3_AIR_TICKS(payload->length);
+	uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, preamble);
+	uint32_t phase = preamble - relay_frame_start(relay_origin, frame);
+	if (frame != relay_grants.frame || phase < RELAY_V3_REPAIR_START) {
+		relay_rx_stats.repair.phase++;
+		return;
+	}
+	unsigned slot = (phase - RELAY_V3_REPAIR_START) / RELAY_V3_SLOT_TICKS;
+	if (slot >= relay_grants.repair_count || relay_grants.grants[slot].owner != repair.helper) {
+		relay_rx_stats.repair.slot++;
+		return;
+	}
+	relay_rx_stats.records += repair.count;
+	struct composite_result validated[RELAY_MAX_CHILDREN];
+	for (unsigned i = 0; i < repair.count; i++) {
+		struct relay_repair_record *r = &repair.records[i];
+		uint8_t child = r->source.frame[1];
+		uint16_t age = (uint16_t)(frame - r->capture_frame);
+		if (r->source.frame[0] == RELAY_COMPOSITE_TYPE) {
+			struct esb_payload part = {.length = r->source.length};
+			memcpy(part.data, r->source.frame, part.length);
+			if (!composite_validate(&part, &validated[i]) || !validated[i].business) {
+				relay_rx_stats.repair.record++;
+				return;
+			}
+		}
+		if (child >= stored_trackers || age >= RELAY_V3_CACHE_FRAMES ||
+		    !(relay_grants.grants[slot].children & BIT(child)) ||
+		    !(relay_grants.missing[age] & BIT(child))) {
+			relay_rx_stats.repair.record++;
+			return;
+		}
+	}
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+	relay_pool_received[slot]++;
+#endif
+
+	for (unsigned i = 0; i < repair.count; i++) {
+		struct relay_repair_record *r = &repair.records[i];
+		uint8_t child = r->source.frame[1];
+		uint32_t captured = frame - (uint16_t)(frame - r->capture_frame);
+		relay_rx_stats.repair.received[child]++;
+		relay_defer_capture(&relay_coord, repair.helper, child, r->source.rssi, k_uptime_get_32());
+		if (!relay_coord_publish(&relay_coord, child, captured)) {
+			relay_rx_stats.duplicate_pose++;
+			if (relay_coord_was_published(&relay_coord, child, captured)) {
+				relay_rx_stats.repair.duplicate[child]++;
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+				ledger_note(relay_session, captured, child, LEDGER_DUPLICATE, -(int16_t)r->source.rssi, repair.helper, frame - captured);
+#endif
+			} else {
+				relay_rx_stats.repair.obsolete[child]++;
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+				ledger_note(relay_session, captured, child, LEDGER_OBSOLETE, -(int16_t)r->source.rssi, repair.helper, frame - captured);
+#endif
+			}
+			continue;
+		}
+		struct esb_payload part = {.length = r->source.length,
+					   .rssi = MAX(payload->rssi, r->source.rssi)};
+		memcpy(part.data, r->source.frame, part.length);
+		relay_repair_delivery = true;
+		if (part.data[0] == RELAY_COMPOSITE_TYPE) {
+			esb_execute_composite(&part, event_ticks, true, &validated[i]);
+		} else {
+			esb_receive_normal(&part, event_ticks, true);
+		}
+		relay_repair_delivery = false;
+		relay_rx_stats.records_accepted++;
+		relay_rx_stats.repair.age[child][frame - captured]++;
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+		ledger_note(relay_session, captured, child, LEDGER_ACCEPT, -(int16_t)r->source.rssi, repair.helper, frame - captured);
+#endif
+		/* A fresh repaired pose also renews the child's membership. */
+		tdma_shadow_observe(child, TDMA_SHADOW_EVIDENCE_DATA);
+		relay_coord_note_frame(&relay_coord, child, RC_RELAYED, RC_SEQ_NORMAL, 0, payload->rssi,
+				       k_uptime_get_32());
+	}
+}
+
+/* Relay bundle from a head: its own frame counts as direct reception from the
+ * head; each record is the child's frame exactly as the child sent it. */
+static void esb_receive_bundle(const struct esb_payload *payload, uint32_t event_ticks)
+{
+	if (relay_profile) {
+		return;
+	}
+	struct relay_bundle_view view;
+	relay_rx_stats.bundles++;
+	if (!relay_bundle_decode(payload->data, (uint8_t)payload->length, &view)
+	    || view.head_id >= stored_trackers || view.head_id >= MAX_TRACKERS
+	    || payload->pipe != 1U + view.head_id % 7U) {
+		relay_rx_stats.bundle_invalid++;
+		return;
+	}
+	/* Blocking the head blocks its whole uplink, bundles included. */
+	uint8_t salt = view.own_len ? view.own[view.own_len - 1]
+		: view.records[0].frame[view.records[0].length - 1];
+	if (relay_block_drop(view.head_id, salt ^ 0x5AU)) {
+		return;
+	}
+	unsigned int key = irq_lock();
+	relay_coord_note_bundle(&relay_coord, view.head_id, view.overflow);
+	irq_unlock(key);
+
+	static struct esb_payload part;
+	if (view.own_len) {
+		memcpy(part.data, view.own, view.own_len);
+		part.length = view.own_len;
+		part.pipe = payload->pipe;
+		part.rssi = payload->rssi;
+		if (part.data[0] == ESB_COMPOSITE_TYPE) {
+			esb_receive_composite(&part, event_ticks, false);
+		} else {
+			esb_receive_normal(&part, event_ticks, false);
+		}
+	}
+	for (uint8_t i = 0; i < view.record_count; i++) {
+		const struct relay_record_view *record = &view.records[i];
+		uint8_t child = record->frame[1];
+		if (child >= stored_trackers || child >= MAX_TRACKERS) {
+			continue;
+		}
+		relay_rx_stats.records++;
+		memcpy(part.data, record->frame, record->length);
+		part.length = record->length;
+		part.pipe = 1U + child % 7U; /* the head received it on this pipe */
+		/* Report the weaker hop so the server never sees a rosier link. */
+		part.rssi = (int8_t)MAX((uint8_t)payload->rssi, record->rssi);
+		if (part.data[0] == ESB_COMPOSITE_TYPE) {
+			esb_receive_composite(&part, event_ticks, true);
+		} else {
+			esb_receive_normal(&part, event_ticks, true);
+		}
+	}
+}
+
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+static void relay_rx_measure(uint32_t start)
+{
+	uint32_t cycles = DWT->CYCCNT - start;
+	relay_rx_cycles_max = MAX(relay_rx_cycles_max, cycles);
+	relay_rx_cycles_total += cycles;
+	relay_rx_packets++;
+}
+
+#endif
 static void event_handler(struct esb_evt const *event)
 {
 	switch (event->evt_id) {
@@ -2646,7 +3606,16 @@ static void event_handler(struct esb_evt const *event)
 		break;
 	case ESB_EVENT_RX_RECEIVED: {
 		int err = 0;
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+		bool measured = false;
+		uint32_t packet_start = 0;
+#endif
 		while (!err) {
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+			if (measured) relay_rx_measure(packet_start);
+			measured = false;
+			packet_start = DWT->CYCCNT;
+#endif
 			err = esb_read_rx_payload(&rx_payload);
 			if (err == -ENODATA) {
 				break;
@@ -2654,6 +3623,9 @@ static void event_handler(struct esb_evt const *event)
 				LOG_ERR("Error while reading rx packet: %d", err);
 				break;
 			}
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+			measured = true;
+#endif
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
 			uint32_t current_rx_ticks = k_uptime_ticks();
 #else
@@ -2679,8 +3651,24 @@ static void event_handler(struct esb_evt const *event)
 				}
 				continue;
 			}
+			if (!discovery && rx_payload.data[0] == RELAY_DIAG_TYPE) {
+				esb_receive_relay_diag(&rx_payload);
+				continue;
+			}
+			if (!discovery && rx_payload.data[0] == RELAY_PEER_REPORT_V3) {
+				esb_receive_peer_report(&rx_payload, (uint32_t)k_uptime_ticks());
+				continue;
+			}
+			if (!discovery && rx_payload.data[0] == RELAY_REPAIR_V3) {
+				esb_receive_repair(&rx_payload, (uint32_t)k_uptime_ticks());
+				continue;
+			}
+			if (!discovery && rx_payload.data[0] == RELAY_BUNDLE_TYPE) {
+				esb_receive_bundle(&rx_payload, current_rx_ticks);
+				continue;
+			}
 			if (!discovery && rx_payload.data[0] == ESB_COMPOSITE_TYPE) {
-				esb_receive_composite(&rx_payload, current_rx_ticks);
+				esb_receive_composite(&rx_payload, current_rx_ticks, false);
 				continue;
 			}
 			switch (rx_payload.length) {
@@ -2778,72 +3766,15 @@ static void event_handler(struct esb_evt const *event)
 				);
 
 				// Check for PING control packet and respond with PONG
-				if (rx_payload.data[0] == ESB_PING_TYPE) {
+				if (rx_payload.data[0] == ESB_PING_TYPE
+				    && !relay_block_drop(rx_payload.data[1], rx_payload.data[2] ^ 0xA5U)) {
 					esb_receive_ping(&rx_payload, current_rx_ticks);
 				}
 				/* Non-PING length-13 OTA types handled at case entry. */
 			} break;
 			case 17: // 16 bytes data + 1 byte sequence number
-			{
-				if (rx_payload.data[0] > 223) {
-					break;
-				}
-				uint8_t tracker_id = rx_payload.data[1];
-
-#if defined(CONFIG_TDMA_DIAGNOSTICS)
-				// TDMA Slot Check for Data (Type 17)
-				tdma_check_slot(tracker_id, current_rx_ticks, rx_payload.rssi);
-#endif
-
-				if (tracker_id >= stored_trackers || tracker_id >= MAX_TRACKERS) {
-					continue;
-				}
-
-				uint8_t received_sequence = rx_payload.data[16];
-				int seq_result = check_packet_sequence(tracker_id, received_sequence);
-				if (rx_payload.pipe == 1 + (tracker_id % 7)) {
-					tdma_shadow_observe(tracker_id, TDMA_SHADOW_EVIDENCE_DATA);
-				}
-				// Decide whether to forward the packet based on the sequence check result
-				// seq_result: 0=normal, 1=potential loss, 2=out of order, 3=reboot, 4=duplicate
-				if (seq_result == 4) {
-					LOG_DBG("TRK %d: Duplicate packet seq=%d, dropped", tracker_id, received_sequence);
-					// Drop duplicate packet
-					break;
-				}
-				if (seq_result == 2) {
-					LOG_DBG("TRK %d: Out-of-order packet seq=%d, dropped", tracker_id, received_sequence);
-					// Drop out-of-order packet to avoid incorrect pose calculation
-					break;
-				}
-
-				if (seq_result == 3 && atomic_get(&test_all_state_valid)) {
-					/* Quick reboot with ambiguous PING counter: drop the
-					 * sticky confirmation and re-arm the grace. The pending
-					 * command itself is left alone — ACK PONGs are PING-
-					 * driven; the PING restart/timeout path parks the flag
-					 * before the next ACK. */
-					atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(tracker_id));
-					atomic_set(
-						&test_all_ready_after_ms[tracker_id],
-						(atomic_val_t)((uint32_t)k_uptime_get() + TEST_ALL_JOIN_CONFIG_GRACE_MS)
-					);
-				}
-
-				// Forward packet for other cases (normal, potential loss, reboot)
-				// For status packets (type 3), fill in packet loss statistics before forwarding
-				if (rx_payload.data[0] == 3) {
-					struct packet_stats *stats = &tracker_slots[tracker_id].stats;
-					rx_payload.data[4] = stats->status_received;
-					rx_payload.data[5] = stats->status_lost;
-					rx_payload.data[6] = 0; // windows_hit (not implemented)
-					rx_payload.data[7] = 0; // windows_missed (not implemented)
-					stats->status_received = 0;
-					stats->status_lost = 0;
-				}
-				hid_write_packet_n(rx_payload.data,
-								   rx_payload.rssi); // write to hid endpoint
-			} break;
+				esb_receive_normal(&rx_payload, current_rx_ticks, false);
+				break;
 			default: {
 				/* OTA packets from tracker (status, firmware info) */
 				uint8_t pkt_type = rx_payload.data[0];
@@ -3117,12 +4048,14 @@ static void tracker_slot_reset(uint8_t id)
 {
 	memset(&tracker_slots[id], 0, sizeof(tracker_slots[id]));
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
+	tdma_stats_generation[id]++;
 	memset(&tracker_diags[id], 0, sizeof(tracker_diags[id]));
 #endif
 	atomic_and(&test_all_confirmed_mask, (atomic_val_t)~BIT(id));
 	atomic_set(&test_all_ready_after_ms[id], 0);
 	channel_target_mask &= ~BIT(id);
 	tdma_shadow_forget_tracker(id);
+	relay_coord_forget(&relay_coord, id, k_uptime_get_32());
 	esb_auto_loss_invalidate();
 	hid_reset_rssi_smooth(id);
 	tracker_events_pairing_invalidate(BIT(id));
@@ -4069,6 +5002,8 @@ void esb_print_health_snapshot(void)
 		tdma_last_loss_step_ms
 	);
 	LOG_INF("HEALTH observed=0x%04x", (unsigned int)observed_mask);
+	LOG_INF("HEALTH pose direct=%u repair=%u duplicate=%u",
+		relay_rx_stats.direct_accepted, relay_rx_stats.records_accepted, relay_rx_stats.duplicate_pose);
 	uint32_t now_ms = (uint32_t)now;
 	uint32_t pending_leave_mask = (uint32_t)atomic_get(&tdma_shadow_pending_leave_mask);
 	uint32_t ping_seen_mask = (uint32_t)atomic_get(&tdma_shadow_ever_ping_mask);
@@ -4448,6 +5383,7 @@ static int tracker_store_restore(void)
 static void esb_thread(void)
 {
 	clocks_start();
+	relay_session = sys_rand32_get();
 
 	int roster_err = tracker_store_restore();
 	uint32_t roster_retry_at = k_uptime_get_32() + 1000;
@@ -4544,3 +5480,429 @@ static void esb_thread(void)
 		k_msleep(100);
 	}
 }
+
+/* ---------------------------------------------------------------------------
+ * Relay console / OTA interface.
+ * ------------------------------------------------------------------------- */
+void esb_relay_set_enabled(bool enabled)
+{
+	unsigned int key = irq_lock();
+	relay_user_enabled = enabled;
+	relay_coord_set_enabled(&relay_coord, enabled && !esb_ota_relay_is_active());
+	irq_unlock(key);
+}
+
+void esb_relay_set_v3_enabled(bool enabled)
+{
+	unsigned int key = irq_lock();
+	relay_coord.v3_requested = enabled;
+	irq_unlock(key);
+}
+
+void esb_relay_pin(uint8_t id, bool pinned)
+{
+	unsigned int key = irq_lock();
+	relay_coord_pin(&relay_coord, id, pinned);
+	irq_unlock(key);
+}
+
+void esb_relay_block(uint8_t id, uint8_t percent)
+{
+	unsigned int key = irq_lock();
+	relay_block_id = percent ? id : 0xFF;
+	relay_block_percent = MIN(percent, 100U);
+	relay_block_mask = 0;
+	irq_unlock(key);
+}
+
+bool esb_relay_block_mask(uint16_t mask, uint8_t seconds)
+{
+	unsigned count = 0;
+	for (unsigned i = 0; i < 11; i++) count += !!(mask & BIT(i));
+	if ((mask & ~0x07ffU) || count > 3 || seconds > 60 || (mask && !seconds)) return false;
+	unsigned key = irq_lock();
+	relay_block_id = 0xff;
+	relay_block_percent = 0;
+	relay_block_deadline = k_uptime_get_32() + seconds * 1000U;
+	relay_block_mask = mask;
+	irq_unlock(key);
+	return true;
+}
+
+bool esb_relay_blocks_ota(uint8_t id)
+{
+	unsigned int key = irq_lock();
+	bool relayed = relay_coord_is_relayed(&relay_coord, id)
+		|| !relay_coord_direct_ready(&relay_coord, id, k_uptime_get_32());
+	irq_unlock(key);
+	return relayed;
+}
+
+void esb_relay_print_pool(void)
+{
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+	for (unsigned slot = 0; slot < RELAY_V3_REPAIR_SLOTS; slot++)
+		printk("  pool slot=%u repair=%u report=%u maintenance=%u idle=%u received=%u\n", slot,
+			relay_pool_reserved[slot][0], relay_pool_reserved[slot][1],
+			relay_pool_reserved[slot][2], relay_pool_reserved[slot][3], relay_pool_received[slot]);
+#endif
+}
+
+void esb_relay_print_status(void)
+{
+	static struct relay_coord snapshot;
+	/* Diagnostic rows need not share one instant. Bound interrupt masking
+	 * while copying the large coordinator, so querying it cannot delay B. */
+	for (size_t offset = 0; offset < sizeof(snapshot); offset += 128U) {
+		unsigned key = irq_lock();
+		memcpy((uint8_t *)&snapshot + offset, (const uint8_t *)&relay_coord + offset,
+			MIN(128U, sizeof(snapshot) - offset));
+		irq_unlock(key);
+	}
+	unsigned int key = irq_lock();
+	struct relay_control control = relay_grants;
+	uint16_t members = (uint16_t)tdma_active_mask;
+	uint8_t block_id = relay_block_id, block_pct = relay_block_percent;
+	uint16_t block_mask = relay_block_mask;
+	int32_t block_left = (int32_t)(relay_block_deadline - k_uptime_get_32());
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	uint64_t rx_cycles = relay_rx_cycles_total;
+	uint32_t rx_packets = relay_rx_packets, rx_max = relay_rx_cycles_max;
+#endif
+	irq_unlock(key);
+	printk("relay: %s pinned=0x%04x members=0x%04x forward=0x%04x relayed=0x%04x assignments=%u rotations=%u releases=%u\n",
+		snapshot.enabled ? "on" : (relay_user_enabled ? "paused(ota)" : "off"),
+		snapshot.pinned, members, snapshot.forward_mask, snapshot.relayed_mask,
+		snapshot.assignments, snapshot.rotations, snapshot.releases);
+	printk("relay: profile=%u B_sent=%u B_failed=%u last_err=%d\n", relay_profile, relay_b_sent,
+		relay_b_failed, relay_b_err);
+	printk("relay: B late=%u late_max=%u plan_max=%u grant_max=%u ticks\n", relay_b_late,
+		relay_b_late_max, relay_b_plan_max, relay_b_grant_max);
+	printk("relay: learning irq_max=%u ticks\n", relay_learn_lock_max);
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	printk("relay: B entry_late=%u entry_max=%u ticks encode_max=%u cycles\n",
+		relay_b_entry_late, relay_b_entry_max, relay_b_encode_cycles_max);
+	printk("relay: B freeze_arm_max=%u cycles; RX max=%u avg=%u cycles packets=%u HID_overflow=%u learning_overflow=%u\n",
+		relay_b_arm_cycles_max, rx_max,
+		rx_packets ? (uint32_t)(rx_cycles / rx_packets) : 0,
+		rx_packets, relay_hid_overflow, relay_learning_overflow);
+
+#endif
+#if defined(CONFIG_TDMA_DIAGNOSTICS)
+	printk("relay: diagnostics_overflow=%u\n", tdma_diag_overflow);
+#endif
+	printk("relay: v3 requested=%s eligible=%u\n", snapshot.v3_requested ? "on" : "off",
+		relay_coord_v3_ready(&snapshot, members));
+	printk("relay: repair seen=%u invalid=%u phase=%u slot=%u record=%u\n",
+	relay_rx_stats.repair.seen, relay_rx_stats.repair.invalid, relay_rx_stats.repair.phase, relay_rx_stats.repair.slot, relay_rx_stats.repair.record);
+	if (relay_profile) {
+		for (uint8_t child = 0; child < RC_MAX; child++) {
+			if (!(members & BIT(child))) {
+				continue;
+			}
+			printk("  repair child=%u received=%u duplicate=%u obsolete=%u age0=%u age1=%u age2=%u\n",
+	child, relay_rx_stats.repair.received[child], relay_rx_stats.repair.duplicate[child], relay_rx_stats.repair.obsolete[child],
+	relay_rx_stats.repair.age[child][0], relay_rx_stats.repair.age[child][1], relay_rx_stats.repair.age[child][2]);
+			printk("  v3 child=%u", child);
+			for (unsigned k = 0; k < 2; k++) {
+				bool valid = (k ? control.backup_valid : control.primary_valid) & BIT(child);
+				uint8_t h = (control.helpers[child] >> (4U * k)) & 15U;
+				const struct rc_peer *p = &snapshot.peer[h][child];
+				uint16_t ratio = relay_coord_peer_ratio(p);
+				printk(" %s=%d ratio=%u rssi=-%u expected=%u state=%s", k ? "backup" : "primary",
+					valid ? h : -1, valid ? ratio : 0, valid ? p->rssi_x8 / 8U : 0,
+					valid ? p->expected : 0, !valid ? "none(no coverage)" :
+					(p->expected >= 120 && ratio >= 950 ? "proven" : "provisional"));
+			}
+			printk("\n");
+			if (!(control.primary_valid & BIT(child)) || !(control.backup_valid & BIT(child))) {
+				uint16_t uplink = 0, topology = 0, negative = 0, capacity = 0, eligible = 0;
+				for (unsigned h = 0; h < RC_MAX; h++) {
+					if (!(members & BIT(h))) continue;
+					if (snapshot.t[h].direct_permille < 950U) uplink |= BIT(h);
+					if (!relay_can_overhear(members, h, child)) topology |= BIT(h);
+					const struct rc_peer *p = &snapshot.peer[h][child];
+					if (p->expected >= 30U && !p->heard) negative |= BIT(h);
+					unsigned load = 0;
+					for (unsigned c = 0; c < RC_MAX; c++)
+						for (unsigned k = 0; k < 2; k++)
+							load += snapshot.choice[c][k].valid && snapshot.choice[c][k].helper == h;
+					if (load >= RELAY_MAX_CHILDREN) capacity |= BIT(h);
+				}
+				eligible = members & ~(uplink | topology | negative);
+				printk("  coverage child=%u eligible=0x%04x reject_uplink=0x%04x topology=0x%04x negative=0x%04x full=0x%04x\n",
+					child, eligible, uplink, topology, negative, capacity);
+			}
+		}
+	}
+	esb_relay_print_pool();
+
+	printk("relay: bundles=%u invalid=%u records=%u accepted=%u blocked=%u block=%d@%u%%\n",
+		relay_rx_stats.bundles, relay_rx_stats.bundle_invalid, relay_rx_stats.records,
+		relay_rx_stats.records_accepted, relay_rx_stats.blocked,
+		block_id == 0xFF ? -1 : block_id, block_pct);
+	printk("relay: block_mask=0x%04x remaining_ms=%u\n",
+		block_left > 0 ? block_mask : 0, block_mask && block_left > 0 ? (unsigned)block_left : 0);
+
+	for (uint8_t i = 0; i < RC_MAX && i < stored_trackers; i++) {
+		const struct rc_tracker *t = &snapshot.t[i];
+		if (!t->seen && !t->capable) {
+			continue;
+		}
+		const char *role = t->role == RC_ROLE_HEAD ? "head" : (t->role == RC_ROLE_CHILD ? "child" : "-");
+		printk("  trk %2u cap=%u role=%-5s direct=%3u.%u%% rssi=-%u", i, t->capable, role,
+			t->direct_permille / 10, t->direct_permille % 10, t->rssi);
+		if (t->role == RC_ROLE_CHILD) {
+			printk(" head=%u delivered=%u", t->head, t->delivered);
+		} else if (t->role == RC_ROLE_HEAD) {
+			printk(" children=0x%04x fwd_slot=%u", t->children,
+				relay_coord_forward_slot(&snapshot, i, members));
+		}
+		printk("\n");
+	}
+	uint32_t now = k_uptime_get_32();
+	for (uint8_t i = 0; i < MAX_TRACKERS; i++) {
+		uint8_t d[RELAY_DIAG_LEN];
+		unsigned int diag_key = irq_lock();
+		bool valid = relay_diag[i].valid;
+		uint32_t age = now - relay_diag[i].rx_ms;
+		memcpy(d, relay_diag[i].data, sizeof(d));
+		irq_unlock(diag_key);
+		if (!valid) {
+			continue;
+		}
+		static const char *const links[] = {"healthy", "degraded", "lost", "?"};
+		uint16_t c[RELAY_DIAG_COUNTERS];
+		for (unsigned k = 0; k < RELAY_DIAG_COUNTERS; k++) {
+			c[k] = (uint16_t)((d[RELAY_DIAG_HEADER_LEN + 2U * k] << 8) | d[RELAY_DIAG_HEADER_LEN + 2U * k + 1U]);
+		}
+		printk("  diag %2u age=%ums link=%s flags=%s%s%s%s%s epoch=%u/%u slot=%u/%u S=%u children=0x%04x members=0x%04x\n",
+			i, age, links[(d[2] >> RELAY_DIAG_LINK_SHIFT) & 3U],
+			d[2] & RELAY_DIAG_F_ASSIGNED ? "A" : "-", d[2] & RELAY_DIAG_F_LEASE ? "L" : "-",
+			d[2] & RELAY_DIAG_F_EPOCH ? "E" : "-", d[2] & RELAY_DIAG_F_HEAD ? "H" : "-",
+			d[2] & RELAY_DIAG_F_LAYOUT ? "T" : "-", d[3], d[4], d[5], d[6], d[7],
+			(d[8] << 8) | d[9], (d[10] << 8) | d[11]);
+		printk("       windows=%u no_window=%u busy=%u rx_any=%u crc_fail=%u len_fail=%u rssi(fail/cap)=-%u/-%u captures=%u foreign=%u forwarded=%u expired=%u presence=%u/%u lease_exp=%u\n",
+			c[RELAY_DIAG_WINDOWS], c[RELAY_DIAG_NO_WINDOW], c[RELAY_DIAG_BUSY],
+			c[RELAY_DIAG_RX_ANY], c[RELAY_DIAG_CRC_FAIL], c[RELAY_DIAG_LEN_FAIL],
+			c[RELAY_DIAG_RSSI] >> 8, c[RELAY_DIAG_RSSI] & 0xFFU, c[RELAY_DIAG_CAPTURES],
+			c[RELAY_DIAG_FOREIGN], c[RELAY_DIAG_FORWARDED], c[RELAY_DIAG_EXPIRED],
+			c[RELAY_DIAG_PRESENCE_RX], c[RELAY_DIAG_PRESENCE], c[RELAY_DIAG_LEASE_EXPIRED]);
+		printk("       start_late_max=%u ticks lengths(fail/cap)=%u/%u\n",
+			c[RELAY_DIAG_START_LATE], c[RELAY_DIAG_LENGTHS] >> 8, c[RELAY_DIAG_LENGTHS] & 0xFFU);
+	}
+}
+
+/* This is the entire mask-dependent and radio-arm path. Keep its boundary
+ * visible to the linked-firmware instruction benchmark. IRQs are held by caller. */
+struct relay_broadcast_work {
+	struct relay_control *control;
+	const struct rc_grant_plan *plan;
+	uint8_t *wire;
+	struct relay_control_crc_plan crc;
+	uint32_t start_event;
+	volatile int result;
+	uint32_t freeze_rtc;
+};
+
+/* Attribute provenance: Round 11 linked model and DWT arm evidence retain the freeze boundary. Whole-thread O3 has only group-level evidence; keep pending isolated A/B. */
+__attribute__((noipa, optimize("O3")))
+static __ramfunc int relay_freeze_arm(struct relay_coord *rc, const struct relay_broadcast_work *w)
+{
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	uint32_t cycles = DWT->CYCCNT;
+#endif
+	struct relay_control *c = w->control;
+	if (!relay_profile || relay_epoch != c->epoch || relay_session != c->session) return -ESTALE;
+	if (!atomic_cas(&radio_operation_busy, 0, 1)) return -EBUSY;
+	int err = esb_prx_broadcast_begin();
+	if (err) goto failed;
+	for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
+		const struct rc_receipt *r = &rc->receipt[w->plan->receipt_index[age]];
+		c->missing[age] = c->expected & ~(r->frame == c->frame - age ? r->received : 0);
+	}
+	/* Arm the immutable radio schedule before encoding the frozen masks.
+	 * TIMER delays TXEN by 21 us after the launch edge, then RADIO ramps
+	 * for 40 us before START consumes the DMA payload. */
+	err = esb_prx_broadcast_arm_event(k_ticks_to_us_floor32(RELAY_V3_TX_OFFSET) - 40U, w->start_event);
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	uint32_t armed = DWT->CYCCNT;
+#endif
+	if (err) goto failed;
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	relay_b_arm_cycles_max = MAX(relay_b_arm_cycles_max, armed - cycles);
+#endif
+	relay_coord_finish_frozen(c, w->plan, w->wire);
+	relay_control_finish_encode(w->wire, c, w->crc, false);
+	__DMB();
+#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+	relay_b_encode_cycles_max = MAX(relay_b_encode_cycles_max, DWT->CYCCNT - armed);
+#endif
+	return 0;
+failed:
+	atomic_set(&radio_operation_busy, 0);
+	return err;
+}
+
+K_SEM_DEFINE(relay_freeze_done, 0, 1);
+
+static void relay_freeze_callback(int32_t channel, uint64_t expires, void *context)
+{
+	ARG_UNUSED(channel);
+	ARG_UNUSED(expires);
+	struct relay_broadcast_work *w = context;
+	while ((int32_t)((NRF_RTC1->COUNTER - w->freeze_rtc) << 8) < 0) { }
+	unsigned key = irq_lock();
+	uint32_t lag = (NRF_RTC1->COUNTER - w->freeze_rtc) & 0x00ffffffU;
+	int err = relay_freeze_arm(&relay_coord, w);
+	if (!err) relay_b_grant_max = MAX(relay_b_grant_max,
+		(NRF_RTC1->COUNTER - w->freeze_rtc) & 0x00ffffffU);
+	relay_b_entry_late += lag > 0;
+	relay_b_entry_max = MAX(relay_b_entry_max, lag);
+	relay_b_late += err == -ETIME;
+	relay_b_late_max = MAX(relay_b_late_max, lag);
+	if (!err) {
+		relay_coord_read_grants(w->control, w->wire);
+		relay_grants = *w->control;
+		relay_coord_commit_grants(&relay_coord, w->control, w->plan);
+	}
+	w->result = err;
+	irq_unlock(key);
+	k_sem_give(&relay_freeze_done);
+}
+
+/* B is prepared outside the radio ISR. ESB owns the bounded PRX/TX/PRX turn. */
+/* Attribute provenance: Round 11 linked model and DWT arm evidence retain the freeze boundary. Whole-thread O3 has only group-level evidence; keep pending isolated A/B. */
+__attribute__((optimize("O3")))
+static void relay_broadcast_thread(void)
+{
+	int rtc_channel = z_nrf_rtc_timer_chan_alloc();
+	if (rtc_channel < 0) {
+		relay_b_err = rtc_channel;
+		LOG_ERR("No RTC launch channel for relay broadcast: %d", relay_b_err);
+		return;
+	}
+	int freeze_channel = z_nrf_rtc_timer_chan_alloc();
+	if (freeze_channel < 0) {
+		z_nrf_rtc_timer_chan_free(rtc_channel);
+		relay_b_err = freeze_channel;
+		LOG_ERR("No RTC freeze channel for relay broadcast: %d", relay_b_err);
+		return;
+	}
+	/* This channel only drives PPI. Keep its event latched until the next
+	 * exact_set so the SDK can reject a missed deadline even if the RTC ISR
+	 * ran before freeze. The channel is owned for this thread's lifetime. */
+	(void)z_nrf_rtc_timer_compare_int_lock(rtc_channel);
+	uint32_t launch_event = z_nrf_rtc_timer_compare_evt_address_get(rtc_channel);
+	uint32_t sent = UINT32_MAX;
+	uint8_t epoch = 0;
+	for (;;) {
+		unsigned key = irq_lock();
+		bool active = esb_initialized && relay_profile && !esb_pairing
+			&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask);
+		uint32_t origin = relay_origin;
+		uint32_t now = (uint32_t)k_uptime_ticks();
+		uint32_t frame = relay_frame_at_tick64(relay_origin64, k_uptime_ticks());
+		uint32_t preamble = relay_frame_start(origin, frame) + RELAY_V3_B_PREAMBLE;
+		relay_frame_anchor = frame;
+		relay_start_anchor = preamble - RELAY_V3_B_PREAMBLE;
+		if (!active || (sent == frame && epoch == relay_epoch)) {
+			irq_unlock(key);
+			k_usleep(200);
+			continue;
+		}
+		/* Plan the watch map early in the frame; only the masks wait for
+		 * the freeze. With 11 members planning takes up to ~0.4 ms. */
+		int32_t lead = preamble - now;
+		if (lead < 8 || lead > 120) {
+			irq_unlock(key);
+			k_usleep(lead > 120 ? k_ticks_to_us_floor32(lead - 120) : 100);
+			continue;
+		}
+		struct relay_control control = {
+			.epoch = relay_epoch, .repair_count = RELAY_V3_REPAIR_SLOTS,
+			.session = relay_session, .frame = frame, .preamble_ticks = preamble,
+			.members = (uint16_t)tdma_active_mask, .expected = (uint16_t)tdma_active_mask,
+			.profile = RELAY_PROFILE_120HZ,
+		};
+		uint32_t t_plan = (uint32_t)k_uptime_ticks();
+		struct rc_grant_plan plan;
+		relay_coord_plan_watch(&relay_coord, &control);
+		relay_coord_plan_grants(&relay_coord, &control, &plan, k_uptime_get_32());
+		struct esb_payload payload = {.pipe = 1, .noack = true, .length = RELAY_CONTROL_LEN};
+		relay_control_encode(payload.data, &control);
+		struct relay_control_crc_plan crc_plan = relay_control_plan_crc(payload.data);
+		uint8_t *wire = esb_prx_broadcast_prepare(&payload);
+		struct relay_broadcast_work work = {
+			.control = &control, .plan = &plan, .wire = wire,
+			.crc = crc_plan, .start_event = launch_event, .result = -ETIMEDOUT,
+		};
+		relay_b_plan_max = MAX(relay_b_plan_max, (uint32_t)k_uptime_ticks() - t_plan);
+		uint32_t launch_tick = preamble - RELAY_V3_TX_OFFSET;
+		uint64_t plan_ticks = k_uptime_ticks();
+		uint64_t launch_rtc = z_nrf_rtc_timer_get_ticks(K_TIMEOUT_ABS_TICKS(
+			plan_ticks + (int32_t)(launch_tick - (uint32_t)plan_ticks)));
+		int schedule_err = z_nrf_rtc_timer_exact_set(rtc_channel, launch_rtc, NULL, NULL);
+		work.freeze_rtc = (uint32_t)(launch_rtc - 1U);
+		if (!schedule_err && wire) {
+			schedule_err = z_nrf_rtc_timer_exact_set(freeze_channel, launch_rtc - 3U,
+				relay_freeze_callback, &work);
+		}
+		sent = frame;
+		epoch = control.epoch;
+		irq_unlock(key);
+		if (schedule_err || !wire) {
+			relay_b_failed++;
+			relay_b_err = schedule_err ? schedule_err : -EBUSY;
+			continue;
+		}
+		/* Wake the RTC ISR ahead of the unchanged freeze edge so callback
+		 * dispatch does not consume the arm interval. Keep the work alive until that callback finishes. */
+		k_sem_take(&relay_freeze_done, K_FOREVER);
+		int err = work.result;
+		if (!err) {
+			err = esb_prx_broadcast_wait(k_ticks_to_us_ceil32(RELAY_V3_B_PREP_LEAD_TICKS));
+			atomic_set(&radio_operation_busy, 0);
+		}
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+		if (!err) {
+			for (unsigned slot = 0; slot < control.repair_count; slot++) {
+				const struct relay_grant *g = &control.grants[slot];
+				unsigned kind = g->owner == RELAY_OWNER_MAINTENANCE ? 2 :
+					g->owner >= RELAY_MAX_TRACKERS ? 3 : g->children ? 0 : 1;
+				relay_pool_reserved[slot][kind]++;
+			}
+		}
+#endif
+
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+		for (unsigned child = 0; child < RELAY_MAX_TRACKERS; child++) {
+			if (!ledger_child_enabled(child)) continue;
+			uint16_t helpers = 0;
+			for (unsigned slot = 0; slot < control.repair_count; slot++) {
+				const struct relay_grant *g = &control.grants[slot];
+				if (g->owner < RELAY_MAX_TRACKERS && (g->children & BIT(child)))
+					helpers |= BIT(g->owner);
+			}
+			for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
+				if (!(control.missing[age] & BIT(child))) continue;
+				uint32_t captured = control.frame - age;
+				ledger_note(relay_session, captured, child, LEDGER_B, err, 255, age);
+				/* Record the actual frozen grants, including non-USB helpers.
+				 * Planning evidence stays separate from receiver acceptance. */
+				ledger_note(relay_session, captured, child, LEDGER_RESCUE_PLAN,
+					plan.rescue_child, plan.rescue_helper, age);
+				ledger_note(relay_session, captured, child, LEDGER_GRANT_HELPERS,
+					helpers, plan.rescue_age, age);
+				ledger_note(relay_session, captured, child, LEDGER_SURVEY_HISTORY,
+					plan.watch[age].survey, plan.watch[age].helpers[child], age);
+			}
+		}
+#endif
+        relay_b_sent += err == 0;
+		relay_b_failed += err != 0;
+		relay_b_err = err ? err : relay_b_err;
+	}
+}
+K_THREAD_DEFINE(relay_broadcast_thread_id, 1536, relay_broadcast_thread,
+	NULL, NULL, NULL, 1, 0, 0);

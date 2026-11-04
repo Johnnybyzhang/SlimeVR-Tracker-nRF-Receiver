@@ -18,6 +18,7 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[2]
 sys.path.insert(0, str(HERE.parent / 'harness'))
 from c_extract import extract_block
+from relay_support import relay_declarations
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--source-root', type=Path, default=ROOT)
@@ -166,6 +167,8 @@ for name, lines in checks.items():
     value = 0 if name == 'check_slot' else 1
     generated += [f'assert(rssi[id] == {value});', '}']
 fixture = (HERE / 'fixture.c').read_text()
+if 'relay_coord_forget' in source:
+    declarations += '\n' + relay_declarations(source)
 fixture = fixture.replace('/* PRODUCTION_DECLARATIONS */', declarations)
 fixture = fixture.replace('/* PRODUCTION_FUNCTIONS */', '\n'.join(functions))
 fixture = fixture.replace('/* GENERATED_SLOT_CHECKS */', '\n'.join(generated))
@@ -185,7 +188,7 @@ with tempfile.TemporaryDirectory(prefix='receiver-state-') as directory:
         subprocess.run(shlex.split(os.environ.get('CC', 'cc')) + [
             '-std=gnu11', '-g', '-O1', '-fsanitize=address,undefined',
             '-fno-omit-frame-pointer', '-fno-pie', '-no-pie',
-            '-I', str(temporary), '-I', str(ROOT / 'src'), *flags, *diagnostic_flags,
+            '-I', str(temporary), '-I', str(ROOT / 'src'), '-I', str(ROOT / 'src/connection'), *flags, *diagnostic_flags,
             str(probe), str(ROOT / 'src/connection/tracker_roster.c'),
             '-o', str(executable),
         ], check=True)

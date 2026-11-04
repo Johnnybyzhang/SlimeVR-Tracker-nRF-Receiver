@@ -22,6 +22,7 @@ import types
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'harness'))
 from c_extract import extract_block
+from relay_support import relay_declarations, relay_helpers
 
 def function(text, name):
     return extract_block(text, r'^[\w \t*]+\b' + re.escape(name) +
@@ -45,6 +46,8 @@ KERNEL = r'''
 extern uint32_t host_now;
 static inline uint32_t k_uptime_get_32(void) { return host_now; }
 static inline int64_t k_uptime_get(void) { return host_now; }
+static inline int64_t k_uptime_ticks(void) { return (int64_t)host_now * 32768 / 1000; }
+static inline uint32_t k_ms_to_ticks_ceil32(uint32_t ms) { return (uint32_t)(((uint64_t)ms * 32768 + 999) / 1000); }
 struct k_spinlock { int unused; };
 typedef unsigned int k_spinlock_key_t;
 static inline k_spinlock_key_t k_spin_lock(struct k_spinlock *s) { (void)s; return 0; }
@@ -191,16 +194,18 @@ def main():
             extract.membership_declarations(esb),
         ] + [extract.declaration(esb, name) for name in layout_names])
         declarations += '\n' + extract.diagnostic_loss_declarations(esb)
+        declarations += '\n' + relay_declarations(esb)
         (path/'esb_membership_declarations.inc').write_text(declarations)
         membership = '\n'.join(function(esb, name) for name in (
             'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
             'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked',
-            'tdma_slot_ticks_for', 'tdma_recalculate'))
+            'tdma_slot_ticks_for', 'tdma_staging_supported_locked', 'tdma_apply_locked',
+            'tdma_apply_finish', 'tdma_recalculate'))
         lengths = function(esb, 'composite_body_length')
-        composite = function(esb, 'esb_receive_composite')
+        composite = extract_block(esb, r'^struct composite_result\s*\{', True) + '\n' + '\n'.join(function(esb, n) for n in ('composite_validate', 'esb_execute_composite', 'esb_receive_composite'))
         clear = function(esb, 'esb_clear')
         (path/'esb_event_paths.inc').write_text(
-            membership + '\n' + lengths + '''
+            membership + '\n' + relay_helpers(esb) + lengths + '''
 static void tracked_tdma_shadow_observe(uint8_t tracker, enum tdma_shadow_evidence kind) {
     assert(tracker==2 && kind==TDMA_SHADOW_EVIDENCE_DATA);
     evidence_calls++;
@@ -211,7 +216,7 @@ static void tracked_tdma_shadow_observe(uint8_t tracker, enum tdma_shadow_eviden
         binary = path/'test'
         command = shlex.split(os.environ.get('CC','cc')) + [
             '-std=c11','-Wall','-Wextra','-Werror','-Wno-misleading-indentation',
-            '-Wno-unused-parameter','-I'+str(path),'-I'+str(root/'src'),
+            '-Wno-unused-parameter','-I'+str(path),'-I'+str(root/'src'),'-I'+str(root/'src/connection'),
             str(root/'src/tracker_events.c'), str(Path(__file__).with_name('fixture.c')),
             '-o',str(binary),
         ]

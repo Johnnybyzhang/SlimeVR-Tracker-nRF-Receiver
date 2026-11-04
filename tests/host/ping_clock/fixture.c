@@ -336,7 +336,7 @@ static struct esb_payload ack_for(const struct esb_payload *p, bool *has_ack)
     assert(!suppress);
     if (*has_ack) {
         ++pong_tick_reads;
-        assert(ack.length == ESB_PONG_LEN && ack.data[0] == ESB_PONG_TYPE);
+        assert(ack.length >= ESB_PONG_LEN && ack.data[0] == ESB_PONG_TYPE);
         assert(ack.data[1] == p->data[1] && ack.data[2] == p->data[2]);
         assert(sys_get_be32(&ack.data[3]) == now_ticks);
         assert(crc8_ccitt(0x07, ack.data, ESB_PONG_LEN - 1) == ack.data[ESB_PONG_LEN - 1]);
@@ -431,6 +431,27 @@ static void test_invalid(const char *which)
     }
     if (strcmp(which, "bad-crc") == 0) assert(tracker_slots[id].crc_error_count == 1);
 }
+static void test_maintenance(void)
+{
+    const uint8_t id = 2;
+    relay_profile = RELAY_PROFILE_120HZ;
+    tdma_active_mask = 7;
+    relay_coord_note_caps(&relay_coord, id, RELAY_CAP_HELPER | (3U << RELAY_CAP_VERSION_SHIFT));
+    now_ticks = RELAY_V3_REPAIR_START + RELAY_V3_TX_OFFSET;
+    struct esb_payload p = packet(ESB_PING_TYPE, id, 3, 1, now_ticks, ESB_PONG_FLAG_NORMAL);
+    bool has_ack = false;
+    struct esb_payload ack = ack_for(&p, &has_ack);
+    struct relay_pong_trailer trailer;
+    assert(has_ack && ack.data[7] == ESB_PONG_FLAG_NORMAL && ack.pipe == 3);
+    assert(ack.length == ESB_PONG_LEN + RELAY_TRAILER_PENDING_LEN);
+    assert(relay_trailer_decode_len(&ack.data[ESB_PONG_LEN], ack.length - ESB_PONG_LEN, &trailer));
+    assert(trailer.pending && trailer.pending_total == (0x80U | RELAY_PROFILE_120HZ));
+    assert(trailer.pending_member_mask == 7 && trailer.pending_slot_ticks == RELAY_V3_SLOT_TICKS);
+    tracker_slots[id].tracker_remote_command = ESB_PONG_FLAG_CALIBRATE;
+    ack = ack_for(&p, &has_ack);
+    assert(has_ack && ack.data[7] == ESB_PONG_FLAG_CALIBRATE);
+}
+
 static void test_valid(void)
 {
     const uint8_t id = 2;
@@ -923,10 +944,11 @@ int main(int argc, char **argv)
         printf("PASS %s\n", argv[1]);
         return 0;
     }
+    if (strcmp(argv[1], "maintenance") == 0) {
+        test_maintenance(); printf("PASS %s\n", argv[1]); return 0;
+    }
     if (strcmp(argv[1], "pairing-gate") == 0) {
-        test_pairing_gate();
-        printf("PASS %s\n", argv[1]);
-        return 0;
+        test_pairing_gate(); printf("PASS %s\n", argv[1]); return 0;
     }
     if (strcmp(argv[1], "valid") == 0) test_valid();
     else if (strcmp(argv[1], "valid-dirty") == 0) test_valid_dirty();
