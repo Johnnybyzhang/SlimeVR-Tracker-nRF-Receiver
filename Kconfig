@@ -186,3 +186,11 @@ config RELAY_CYCLE_DIAGNOSTICS
     default n
     help
         Measure relay processing with DWT. Production omits these probes.
+
+config RELAY_IRQ_DIAGNOSTICS
+    bool "Whole relay IRQ lock duration probes"
+    depends on CPU_CORTEX_M_HAS_DWT
+    default n
+    help
+        Diagnostic-only DWT maxima for complete source or coordinator locks.
+        Retains all production guards. Never enable for acceptance images.
