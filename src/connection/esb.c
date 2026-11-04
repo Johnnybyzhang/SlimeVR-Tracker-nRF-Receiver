@@ -666,8 +666,9 @@ static uint32_t relay_rx_cycles_max, relay_rx_packets;
 static uint64_t relay_rx_cycles_total;
 #endif
 static int relay_b_err;
-static uint32_t relay_direct_start[MAX_TRACKERS];
-static bool relay_direct_pose[MAX_TRACKERS];
+static uint32_t relay_layout_generation;
+static uint32_t relay_direct_start;
+static bool relay_direct_pose;
 static struct {
 	struct tdma_publication p;
 	uint32_t activation_ticks;
@@ -734,6 +735,7 @@ static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
 		relay_origin64 = now + (int32_t)(relay_origin - (uint32_t)now);
 	}
 	relay_profile = p->profile;
+	relay_layout_generation++;
 	relay_epoch = p->epoch;
 	if (p->profile) {
 		relay_coord_fast_reset(&relay_coord);
@@ -2213,13 +2215,13 @@ static int relay_sequence_check(uint8_t id, uint8_t seq, bool relayed, uint8_t r
 		packet_stats_count(&tracker_slots[id].stats);
 		return RC_SEQ_NORMAL;
 	}
-	if (relay_profile && !relayed && !relay_direct_pose[id]) {
+	if (relay_profile && !relayed && !relay_direct_pose) {
 		return RC_SEQ_OLD;
 	}
-	if (relay_profile && relay_direct_pose[id] && !relayed) {
-		uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
+	if (relay_profile && relay_direct_pose && !relayed) {
+		uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start);
 		int slot = relay_member_slot((uint16_t)tdma_active_mask, id);
-		uint32_t phase = relay_direct_start[id] - relay_frame_start(relay_origin, frame);
+		uint32_t phase = relay_direct_start - relay_frame_start(relay_origin, frame);
 		if (slot < 0 || phase / RELAY_V3_SLOT_TICKS != (uint32_t)slot) {
 			return RC_SEQ_OLD;
 		}
@@ -2269,6 +2271,17 @@ static void relay_take_caps(uint8_t id, uint8_t *info16)
  *
  * Samples state published by event_handler and threads without blocking or logging.
  * -------------------------------------------------------------------------*/
+static void relay_rx_metadata(struct esb_payload *payload)
+{
+	payload->rx_context = relay_layout_generation;
+	if (payload->length <= 1 || payload->data[1] >= MAX_TRACKERS) return;
+	uint8_t id = payload->data[1];
+	int slot = relay_member_slot((uint16_t)tdma_active_mask, id);
+	payload->rx_pose = relay_profile && payload->pipe == 1U + id % 7U && slot >= 0
+		&& payload->length <= relay_direct_payload_max(relay_profile, (uint8_t)slot)
+		&& relay_frame_is_pose(payload->data, payload->length, id);
+}
+
 static void esb_ack_handler_cb(
 	const uint8_t *pdu_data,
 	uint8_t data_length,
@@ -2355,29 +2368,29 @@ static void esb_ack_handler_cb(
 		/* Judge the slot by where the frame started: a 60-byte composite
 		 * ends close enough to the slot edge that its END can land in the
 		 * next slot. */
-		relay_direct_start[id] = (uint32_t)k_uptime_ticks() - RELAY_V3_AIR_TICKS(data_length);
+		uint32_t start_ticks = (uint32_t)k_uptime_ticks() - RELAY_V3_AIR_TICKS(data_length);
 		int slot = relay_member_slot((uint16_t)tdma_active_mask, id);
-		relay_direct_pose[id] = pipe_id == 1U + id % 7U && slot >= 0
+		bool pose = pipe_id == 1U + id % 7U && slot >= 0
 			&& data_length <= relay_direct_payload_max(relay_profile, (uint8_t)slot)
 			&& relay_frame_is_pose(pdu_data, data_length, id);
 #ifdef CONFIG_RELAY_FRAME_LEDGER
 		/* Observe RF arrival without publishing a forced-dropped frame. The
 		 * phase is an ISR-time estimate of its preamble, not a receipt bit. */
-		if (relay_direct_pose[id] && ledger_child_enabled(id)) {
-			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
+		if (pose && ledger_child_enabled(id)) {
+			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, start_ticks);
 			uint32_t slot_start = relay_frame_start(relay_origin, frame) + slot * RELAY_V3_SLOT_TICKS;
 			ledger_note(relay_session, frame, id, LEDGER_DIRECT_SEEN,
-				(int32_t)(relay_direct_start[id] - slot_start), 255, 0);
+				(int32_t)(start_ticks - slot_start), 255, 0);
 		}
 #endif
 		/* B can preempt the deferred RX event after D10 has reached the
 		 * radio. Freeze RF receipt here; publication keeps its own watermark.
 		 * A configured drop must still be announced as missing. */
-		if (relay_direct_pose[id] && id < stored_trackers
+		if (pose && id < stored_trackers
 		    && !relay_multi_blocked(id) && (id != relay_block_id || !relay_block_percent)
 		    && relay_early_receipt_valid(pdu_data, data_length)) {
-			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, relay_direct_start[id]);
-			uint32_t phase = relay_direct_start[id] - relay_frame_start(relay_origin, frame);
+			uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, start_ticks);
+			uint32_t phase = start_ticks - relay_frame_start(relay_origin, frame);
 			if (phase / RELAY_V3_SLOT_TICKS == (uint32_t)slot) {
 				relay_coord_receive(&relay_coord, id, frame);
 			}
@@ -3626,11 +3639,10 @@ static void event_handler(struct esb_evt const *event)
 #ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
 			measured = true;
 #endif
-#if defined(CONFIG_TDMA_DIAGNOSTICS)
-			uint32_t current_rx_ticks = k_uptime_ticks();
-#else
-			const uint32_t current_rx_ticks = 0;
-#endif
+			uint32_t current_rx_ticks = rx_payload.rx_ticks;
+			if (relay_profile && rx_payload.rx_context != relay_layout_generation) continue;
+			relay_direct_start = current_rx_ticks - RELAY_V3_AIR_TICKS(rx_payload.length);
+			relay_direct_pose = rx_payload.rx_pose;
 			if (rx_payload.length == 0) {
 				continue;
 			}
@@ -3656,11 +3668,11 @@ static void event_handler(struct esb_evt const *event)
 				continue;
 			}
 			if (!discovery && rx_payload.data[0] == RELAY_PEER_REPORT_V3) {
-				esb_receive_peer_report(&rx_payload, (uint32_t)k_uptime_ticks());
+				esb_receive_peer_report(&rx_payload, current_rx_ticks);
 				continue;
 			}
 			if (!discovery && rx_payload.data[0] == RELAY_REPAIR_V3) {
-				esb_receive_repair(&rx_payload, (uint32_t)k_uptime_ticks());
+				esb_receive_repair(&rx_payload, current_rx_ticks);
 				continue;
 			}
 			if (!discovery && rx_payload.data[0] == RELAY_BUNDLE_TYPE) {
@@ -3910,6 +3922,7 @@ static int esb_initialize_internal(bool tx, bool quiet)
 		config.protocol = ESB_PROTOCOL_ESB_DPL;
 		config.mode = ESB_MODE_PRX;
 		config.event_handler = event_handler;
+		config.rx_metadata_handler = relay_rx_metadata;
 		config.ack_handler = esb_ack_handler_cb;
 		config.tx_output_power = CONFIG_RADIO_TX_POWER;
 		config.retransmit_delay = RADIO_RETRANSMIT_DELAY;
