@@ -818,15 +818,20 @@ bool hid_write_tracker_event(const uint8_t record[16], uint32_t generation)
 	return hid_enqueue_packet(record, generation);
 }
 
-void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
+bool hid_try_write_packet_n(const uint8_t *data, uint8_t rssi)
 {
 	uint8_t pkt[16];
+	unsigned key = irq_lock();
+	uint8_t id = data[1];
+	struct rssi_ema_state previous = {0};
+	if (id < MAX_TRACKERS) previous = rssi_states[id];
 
 	// Drop packets with all-zero quaternion (type 1 and 4: quat in bytes 2-9).
 	if (data[0] == 1 || data[0] == 4) {
 		if ((data[2] | data[3] | data[4] | data[5] |
 		     data[6] | data[7] | data[8] | data[9]) == 0) {
-			return;
+			irq_unlock(key);
+			return true;
 		}
 	}
 
@@ -840,5 +845,13 @@ void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
 		}
 	}
 
-	(void)hid_enqueue_packet(pkt, 0);
+	bool accepted = hid_enqueue_packet(pkt, 0);
+	if (!accepted && id < MAX_TRACKERS) rssi_states[id] = previous;
+	irq_unlock(key);
+	return accepted;
+}
+
+void hid_write_packet_n(const uint8_t *data, uint8_t rssi)
+{
+	(void)hid_try_write_packet_n(data, rssi);
 }
