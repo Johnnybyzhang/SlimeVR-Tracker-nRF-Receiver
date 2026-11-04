@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.20.0)
+list(APPEND BOARD_ROOT ${CMAKE_CURRENT_LIST_DIR}/..)
+set(BOARD_DEFCONFIG ${CMAKE_CURRENT_LIST_DIR}/board_defconfig)
+set(DTC_OVERLAY_FILE "${CMAKE_CURRENT_LIST_DIR}/../dts/partitions/nrf52840_dongle.overlay;${CMAKE_CURRENT_LIST_DIR}/app.overlay")
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(relay_sniffer)
+target_sources(app PRIVATE main.c radio.c core.c)
+target_include_directories(app PRIVATE ../src/connection)

@@ -1,0 +1,16 @@
+--- a/scripts/relay_ledger_join.py
++++ b/scripts/relay_ledger_join.py
+@@ -59,5 +59,11 @@
+  return dict(refusal_frames=dict(refused_frames), refusal_reasons={k:dict(v) for k,v in refusals.items()},child=child,first=lo,last=hi,denominator=len(rows),ages=dict(bins),loss_attribution=dict(attribution),within3=sum(bins[str(i)] for i in range(4))/len(rows),rows=rows)
+
+ if __name__=='__main__':
+- p=argparse.ArgumentParser();p.add_argument('child',type=int);p.add_argument('files',nargs='+',type=pathlib.Path);p.add_argument('-o',type=pathlib.Path,required=True);a=p.parse_args()
+- result=join(a.files,a.child);a.o.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps({k:v for k,v in result.items() if k!='rows'},indent=2))
++ p=argparse.ArgumentParser();p.add_argument('child',type=int);p.add_argument('files',nargs='+',type=pathlib.Path);p.add_argument('-o',type=pathlib.Path,required=True);p.add_argument('--air',type=pathlib.Path);p.add_argument('--air-tool',type=pathlib.Path,default=pathlib.Path(__file__).with_name('relay_sniffer.py'));a=p.parse_args()
++ result=join(a.files,a.child)
++ if a.air:
++  import importlib.util
++  spec=importlib.util.spec_from_file_location('relay_sniffer',a.air_tool)
++  air_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(air_module)
++  with a.air.open() as stream:air_module.attach_air(result,(json.loads(line) for line in stream if line.strip()))
++ a.o.write_text(json.dumps(result,indent=2)+'\n');print(json.dumps({k:v for k,v in result.items() if k!='rows'},indent=2))

@@ -1,0 +1,4 @@
+&cdc_acm_uart { status = "disabled"; };
+&radio {
+	/delete-property/ fem;
+};
