@@ -19,6 +19,10 @@ static void control(void)
 	assert(bytes[0] == 0xE8 && bytes[1] == 3 && bytes[4] == 0x12 && bytes[7] == 0x78);
 	assert(bytes[12] == 0xDE && bytes[15] == 0xEF && bytes[30] == 0x2F);
 	assert(bytes[46] == 15 && bytes[51] == 0 && bytes[52] == 1);
+	assert(RELAY_CONTROL_OFF_OWNERS == 46 && RELAY_CONTROL_OFF_CHILDREN == 51);
+	assert(bytes[RELAY_CONTROL_OFF_OWNERS] == 15);
+	assert(relay_get_be16(bytes + RELAY_CONTROL_OFF_CHILDREN) == 1);
+	assert(RELAY_CONTROL_OFF_SURVEY == 61 && RELAY_CONTROL_OFF_FLAGS == 67);
 	struct relay_control decoded;
 	assert(relay_control_decode(bytes, 72, &decoded));
 	assert(relay_control_encode(encoded, &decoded) == 72 && !memcmp(bytes, encoded, 72));
@@ -162,9 +166,26 @@ static void frame_epochs(void)
 	assert((uint16_t)(65537U-(uint16_t)65535U)==2);
 }
 
+static void control_coordinates(void)
+{
+	for (uint32_t f = 15728630; f < 15728660; f++) {
+		uint32_t origin = 0xfffffff0U;
+		uint32_t start = relay_frame_start(origin, f);
+		uint32_t preamble = start + RELAY_V3_B_PREAMBLE;
+		assert(relay_control_start(preamble) == start);
+		assert(relay_control_origin(preamble, f) == origin);
+		for (unsigned i = 0; i < RELAY_V3_REPAIR_SLOTS; i++) {
+			uint32_t at = relay_repair_start(preamble, i);
+			assert(at == start + RELAY_V3_REPAIR_START + i * RELAY_V3_SLOT_TICKS);
+			assert(relay_frame_near(f, start, at) == f);
+			assert(relay_repair_slot(relay_frame_phase(origin, f, at)) == i);
+		}
+	}
+}
+
 int main(void)
 {
- frame_epochs();
+ control_coordinates(); frame_epochs();
 	freeze_mask_crc(); control(); repairs(); descriptors(); cadence();
 	puts("v3 wire and rational cadence: passed");
 	return 0;
