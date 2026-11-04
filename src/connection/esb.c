@@ -3450,11 +3450,11 @@ static void esb_receive_peer_report(const struct esb_payload *payload, uint32_t 
 	}
 	uint32_t preamble = event_ticks - RELAY_V3_AIR_TICKS(payload->length);
 	uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, preamble);
-	uint32_t phase = preamble - relay_frame_start(relay_origin, frame);
+	uint32_t phase = relay_frame_phase(relay_origin, frame, preamble);
 	if (frame != relay_grants.frame || phase < RELAY_V3_REPAIR_START) {
 		return;
 	}
-	unsigned slot = (phase - RELAY_V3_REPAIR_START) / RELAY_V3_SLOT_TICKS;
+	unsigned slot = relay_repair_slot(phase);
 	(void)relay_defer_report(&relay_coord, &relay_grants, slot, &report, k_uptime_get_32());
 }
 
@@ -3470,12 +3470,12 @@ static void esb_receive_repair(const struct esb_payload *payload, uint32_t event
 	}
 	uint32_t preamble = event_ticks - RELAY_V3_AIR_TICKS(payload->length);
 	uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, preamble);
-	uint32_t phase = preamble - relay_frame_start(relay_origin, frame);
+	uint32_t phase = relay_frame_phase(relay_origin, frame, preamble);
 	if (frame != relay_grants.frame || phase < RELAY_V3_REPAIR_START) {
 		relay_rx_stats.repair.phase++;
 		return;
 	}
-	unsigned slot = (phase - RELAY_V3_REPAIR_START) / RELAY_V3_SLOT_TICKS;
+	unsigned slot = relay_repair_slot(phase);
 	if (slot >= relay_grants.repair_count || relay_grants.grants[slot].owner != repair.helper) {
 		relay_rx_stats.repair.slot++;
 		return;
@@ -5614,14 +5614,14 @@ void esb_relay_print_status(void)
 				printk(" %s=%d ratio=%u rssi=-%u expected=%u state=%s", k ? "backup" : "primary",
 					valid ? h : -1, valid ? ratio : 0, valid ? p->rssi_x8 / 8U : 0,
 					valid ? p->expected : 0, !valid ? "none(no coverage)" :
-					(p->expected >= 120 && ratio >= 950 ? "proven" : "provisional"));
+					(p->expected >= 120 && ratio >= RC_HEAD_MIN_PERMILLE ? "proven" : "provisional"));
 			}
 			printk("\n");
 			if (!(control.primary_valid & BIT(child)) || !(control.backup_valid & BIT(child))) {
 				uint16_t uplink = 0, topology = 0, negative = 0, capacity = 0, eligible = 0;
 				for (unsigned h = 0; h < RC_MAX; h++) {
 					if (!(members & BIT(h))) continue;
-					if (snapshot.t[h].direct_permille < 950U) uplink |= BIT(h);
+					if (snapshot.t[h].direct_permille < RC_HEAD_MIN_PERMILLE) uplink |= BIT(h);
 					if (!relay_can_overhear(members, h, child)) topology |= BIT(h);
 					const struct rc_peer *p = &snapshot.peer[h][child];
 					if (p->expected >= 30U && !p->heard) negative |= BIT(h);

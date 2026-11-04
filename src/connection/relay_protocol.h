@@ -624,34 +624,67 @@ static inline bool relay_control_valid(const struct relay_control *c)
 	return true;
 }
 
+enum relay_control_offset {
+	RELAY_CONTROL_OFF_TYPE = 0,
+	RELAY_CONTROL_OFF_VERSION = 1,
+	RELAY_CONTROL_OFF_EPOCH = 2,
+	RELAY_CONTROL_OFF_REPAIR_COUNT = 3,
+	RELAY_CONTROL_OFF_SESSION = 4,
+	RELAY_CONTROL_OFF_FRAME = 8,
+	RELAY_CONTROL_OFF_PREAMBLE = 12,
+	RELAY_CONTROL_OFF_MEMBERS = 16,
+	RELAY_CONTROL_OFF_EXPECTED = 18,
+	RELAY_CONTROL_OFF_MISSING = 20,
+	RELAY_CONTROL_OFF_PRIMARY = 26,
+	RELAY_CONTROL_OFF_BACKUP = 28,
+	RELAY_CONTROL_OFF_HELPERS = 30,
+	RELAY_CONTROL_OFF_OWNERS = 46,
+	RELAY_CONTROL_OFF_OWNER_SECOND = 47,
+	RELAY_CONTROL_OFF_CHILDREN = 51,
+	RELAY_CONTROL_OFF_CHILDREN_LOW = 52,
+	RELAY_CONTROL_OFF_SURVEY = 61,
+	RELAY_CONTROL_OFF_MAINTENANCE = 63,
+	RELAY_CONTROL_OFF_WATCH = 64,
+	RELAY_CONTROL_OFF_PROFILE = 66,
+	RELAY_CONTROL_OFF_FLAGS = 67,
+	RELAY_CONTROL_OFF_RESERVED = 68,
+	RELAY_CONTROL_OFF_RESERVED_SECOND = 69,
+	RELAY_CONTROL_OFF_RESERVED_THIRD = 70,
+	RELAY_CONTROL_OFF_CRC = 71,
+};
+_Static_assert(RELAY_CONTROL_OFF_OWNERS + RELAY_V3_REPAIR_SLOTS == RELAY_CONTROL_OFF_CHILDREN, "grant owner layout");
+_Static_assert(RELAY_CONTROL_OFF_CHILDREN + 2 * RELAY_V3_REPAIR_SLOTS == RELAY_CONTROL_OFF_SURVEY, "grant children layout");
+_Static_assert(RELAY_CONTROL_OFF_HELPERS + RELAY_MAX_TRACKERS == RELAY_CONTROL_OFF_OWNERS, "helper layout");
+_Static_assert(RELAY_CONTROL_OFF_CRC + 1 == RELAY_CONTROL_LEN, "control wire size");
+
 static inline size_t relay_control_encode(uint8_t out[RELAY_CONTROL_LEN], const struct relay_control *c)
 {
 	memset(out, 0, RELAY_CONTROL_LEN);
-	out[0] = RELAY_CONTROL_V3;
-	out[1] = RELAY_V3_VERSION;
-	out[2] = c->epoch;
-	out[3] = c->repair_count;
-	relay_put_be32(out + 4, c->session);
-	relay_put_be32(out + 8, c->frame);
-	relay_put_be32(out + 12, c->preamble_ticks);
-	relay_put_be16(out + 16, c->members);
-	relay_put_be16(out + 18, c->expected);
+	out[RELAY_CONTROL_OFF_TYPE] = RELAY_CONTROL_V3;
+	out[RELAY_CONTROL_OFF_VERSION] = RELAY_V3_VERSION;
+	out[RELAY_CONTROL_OFF_EPOCH] = c->epoch;
+	out[RELAY_CONTROL_OFF_REPAIR_COUNT] = c->repair_count;
+	relay_put_be32(out + RELAY_CONTROL_OFF_SESSION, c->session);
+	relay_put_be32(out + RELAY_CONTROL_OFF_FRAME, c->frame);
+	relay_put_be32(out + RELAY_CONTROL_OFF_PREAMBLE, c->preamble_ticks);
+	relay_put_be16(out + RELAY_CONTROL_OFF_MEMBERS, c->members);
+	relay_put_be16(out + RELAY_CONTROL_OFF_EXPECTED, c->expected);
 	for (uint8_t i = 0; i < RELAY_V3_CACHE_FRAMES; i++) {
-		relay_put_be16(out + 20 + 2U * i, c->missing[i]);
+		relay_put_be16(out + RELAY_CONTROL_OFF_MISSING + 2U * i, c->missing[i]);
 	}
-	relay_put_be16(out + 26, c->primary_valid);
-	relay_put_be16(out + 28, c->backup_valid);
-	memcpy(out + 30, c->helpers, RELAY_MAX_TRACKERS);
+	relay_put_be16(out + RELAY_CONTROL_OFF_PRIMARY, c->primary_valid);
+	relay_put_be16(out + RELAY_CONTROL_OFF_BACKUP, c->backup_valid);
+	memcpy(out + RELAY_CONTROL_OFF_HELPERS, c->helpers, RELAY_MAX_TRACKERS);
 	for (uint8_t i = 0; i < RELAY_V3_REPAIR_SLOTS; i++) {
-		out[46 + i] = c->grants[i].owner;
-		relay_put_be16(out + 51 + 2U * i, c->grants[i].children);
+		out[RELAY_CONTROL_OFF_OWNERS + i] = c->grants[i].owner;
+		relay_put_be16(out + RELAY_CONTROL_OFF_CHILDREN + 2U * i, c->grants[i].children);
 	}
-	relay_put_be16(out + 61, c->survey);
-	out[63] = c->maintenance_owner;
-	relay_put_be16(out + 64, c->watch_generation);
-	out[66] = c->profile;
-	out[67] = c->flags;
-	out[71] = relay_crc8(7, out, 71);
+	relay_put_be16(out + RELAY_CONTROL_OFF_SURVEY, c->survey);
+	out[RELAY_CONTROL_OFF_MAINTENANCE] = c->maintenance_owner;
+	relay_put_be16(out + RELAY_CONTROL_OFF_WATCH, c->watch_generation);
+	out[RELAY_CONTROL_OFF_PROFILE] = c->profile;
+	out[RELAY_CONTROL_OFF_FLAGS] = c->flags;
+	out[RELAY_CONTROL_OFF_CRC] = relay_crc8(7, out, 71);
 	return RELAY_CONTROL_LEN;
 }
 
@@ -662,7 +695,7 @@ struct relay_control_crc_plan { uint8_t prefix, watch, layout; };
 static inline struct relay_control_crc_plan relay_control_plan_crc(const uint8_t *out)
 {
 	return (struct relay_control_crc_plan){relay_crc8(7, out, 20),
-		relay_crc8(0, out + 26, 20), relay_crc8(0, out + 64, 3)};
+		relay_crc8(0, out + RELAY_CONTROL_OFF_PRIMARY, 20), relay_crc8(0, out + RELAY_CONTROL_OFF_WATCH, 3)};
 }
 
 #if defined(__GNUC__) && !defined(__clang__)
@@ -709,52 +742,52 @@ static inline void relay_control_finish_encode(uint8_t *out, const struct relay_
 		0x06, 0x2a, 0x5e, 0x72, 0xb6, 0x9a, 0xee, 0xc2, 0x61, 0x4d, 0x39, 0x15, 0xd1, 0xfd, 0x89, 0xa5,
 	};
 	for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
-		relay_put_be16(out + 20 + 2U * age, c->missing[age]);
+		relay_put_be16(out + RELAY_CONTROL_OFF_MISSING + 2U * age, c->missing[age]);
 	}
 	for (unsigned i = 0; write_grants && i < RELAY_V3_REPAIR_SLOTS; i++) {
-		out[46 + i] = c->grants[i].owner;
-		relay_put_be16(out + 51 + 2U * i, c->grants[i].children);
+		out[RELAY_CONTROL_OFF_OWNERS + i] = c->grants[i].owner;
+		relay_put_be16(out + RELAY_CONTROL_OFF_CHILDREN + 2U * i, c->grants[i].children);
 	}
-	relay_put_be16(out + 61, c->survey);
-	out[63] = c->maintenance_owner;
-	out[67] = c->flags;
-	uint8_t v = relay_crc8(crc.prefix, out + 20, 6);
+	relay_put_be16(out + RELAY_CONTROL_OFF_SURVEY, c->survey);
+	out[RELAY_CONTROL_OFF_MAINTENANCE] = c->maintenance_owner;
+	out[RELAY_CONTROL_OFF_FLAGS] = c->flags;
+	uint8_t v = relay_crc8(crc.prefix, out + RELAY_CONTROL_OFF_MISSING, 6);
 	v = shift20[v] ^ crc.watch;
-	v = relay_crc8(v, out + 46, 18);
+	v = relay_crc8(v, out + RELAY_CONTROL_OFF_OWNERS, 18);
 	v = shift3[v] ^ crc.layout;
-	v = relay_crc8(v, out + 67, 1);
-	out[71] = shift3[v];
+	v = relay_crc8(v, out + RELAY_CONTROL_OFF_FLAGS, 1);
+	out[RELAY_CONTROL_OFF_CRC] = shift3[v];
 }
 
 static inline bool relay_control_decode(const uint8_t *in, size_t length, struct relay_control *c)
 {
-	if (length != RELAY_CONTROL_LEN || in[0] != RELAY_CONTROL_V3
-	    || in[1] != RELAY_V3_VERSION || in[68] || in[69] || in[70]
-	    || in[71] != relay_crc8(7, in, 71)) {
+	if (length != RELAY_CONTROL_LEN || in[RELAY_CONTROL_OFF_TYPE] != RELAY_CONTROL_V3
+	    || in[RELAY_CONTROL_OFF_VERSION] != RELAY_V3_VERSION || in[RELAY_CONTROL_OFF_RESERVED] || in[RELAY_CONTROL_OFF_RESERVED_SECOND] || in[RELAY_CONTROL_OFF_RESERVED_THIRD]
+	    || in[RELAY_CONTROL_OFF_CRC] != relay_crc8(7, in, 71)) {
 		return false;
 	}
-	c->epoch = in[2];
-	c->repair_count = in[3];
-	c->session = relay_get_be32(in + 4);
-	c->frame = relay_get_be32(in + 8);
-	c->preamble_ticks = relay_get_be32(in + 12);
-	c->members = relay_get_be16(in + 16);
-	c->expected = relay_get_be16(in + 18);
+	c->epoch = in[RELAY_CONTROL_OFF_EPOCH];
+	c->repair_count = in[RELAY_CONTROL_OFF_REPAIR_COUNT];
+	c->session = relay_get_be32(in + RELAY_CONTROL_OFF_SESSION);
+	c->frame = relay_get_be32(in + RELAY_CONTROL_OFF_FRAME);
+	c->preamble_ticks = relay_get_be32(in + RELAY_CONTROL_OFF_PREAMBLE);
+	c->members = relay_get_be16(in + RELAY_CONTROL_OFF_MEMBERS);
+	c->expected = relay_get_be16(in + RELAY_CONTROL_OFF_EXPECTED);
 	for (uint8_t i = 0; i < RELAY_V3_CACHE_FRAMES; i++) {
-		c->missing[i] = relay_get_be16(in + 20 + 2U * i);
+		c->missing[i] = relay_get_be16(in + RELAY_CONTROL_OFF_MISSING + 2U * i);
 	}
-	c->primary_valid = relay_get_be16(in + 26);
-	c->backup_valid = relay_get_be16(in + 28);
-	memcpy(c->helpers, in + 30, RELAY_MAX_TRACKERS);
+	c->primary_valid = relay_get_be16(in + RELAY_CONTROL_OFF_PRIMARY);
+	c->backup_valid = relay_get_be16(in + RELAY_CONTROL_OFF_BACKUP);
+	memcpy(c->helpers, in + RELAY_CONTROL_OFF_HELPERS, RELAY_MAX_TRACKERS);
 	for (uint8_t i = 0; i < RELAY_V3_REPAIR_SLOTS; i++) {
-		c->grants[i].owner = in[46 + i];
-		c->grants[i].children = relay_get_be16(in + 51 + 2U * i);
+		c->grants[i].owner = in[RELAY_CONTROL_OFF_OWNERS + i];
+		c->grants[i].children = relay_get_be16(in + RELAY_CONTROL_OFF_CHILDREN + 2U * i);
 	}
-	c->survey = relay_get_be16(in + 61);
-	c->maintenance_owner = in[63];
-	c->watch_generation = relay_get_be16(in + 64);
-	c->profile = in[66];
-	c->flags = in[67];
+	c->survey = relay_get_be16(in + RELAY_CONTROL_OFF_SURVEY);
+	c->maintenance_owner = in[RELAY_CONTROL_OFF_MAINTENANCE];
+	c->watch_generation = relay_get_be16(in + RELAY_CONTROL_OFF_WATCH);
+	c->profile = in[RELAY_CONTROL_OFF_PROFILE];
+	c->flags = in[RELAY_CONTROL_OFF_FLAGS];
 	return relay_control_valid(c);
 }
 
@@ -942,6 +975,33 @@ static inline uint32_t relay_frame_at_tick64(uint64_t origin, uint64_t tick)
 {
 	uint64_t delta = tick - origin;
 	return (uint32_t)((delta / 4096U) * 15U + ((delta % 4096U) * 15U + 14U) / 4096U);
+}
+
+/* B's preamble and the rational-grid frame start are distinct coordinates. */
+static inline uint32_t relay_control_start(uint32_t preamble)
+{
+	return preamble - RELAY_V3_B_PREAMBLE;
+}
+
+static inline uint32_t relay_control_origin(uint32_t preamble, uint32_t frame)
+{
+	return relay_control_start(preamble) - relay_frame_start(0, frame);
+}
+
+static inline uint32_t relay_repair_start(uint32_t preamble, unsigned slot)
+{
+	return relay_control_start(preamble) + RELAY_V3_REPAIR_START + slot * RELAY_V3_SLOT_TICKS;
+}
+
+static inline uint32_t relay_frame_phase(uint32_t origin, uint32_t frame, uint32_t tick)
+{
+	return tick - relay_frame_start(origin, frame);
+}
+
+/* Caller first rejects phases before the repair region. */
+static inline unsigned relay_repair_slot(uint32_t phase)
+{
+	return (phase - RELAY_V3_REPAIR_START) / RELAY_V3_SLOT_TICKS;
 }
 
 static inline uint8_t relay_direct_payload_max(uint8_t profile, uint8_t slot)

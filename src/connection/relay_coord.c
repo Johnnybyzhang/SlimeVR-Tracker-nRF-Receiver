@@ -681,7 +681,7 @@ static bool rc_listener(const struct relay_coord *rc, uint8_t child, uint8_t h)
 	const struct rc_peer *p = &rc->peer[h][child];
 	/* Unknown peers may collect provisional evidence. A measured silent
 	 * link must yield its repair slots; surveys can establish recovery. */
-	return relay_can_overhear(rc->learn_members, h, child) && rc->t[h].direct_permille >= 950U &&
+	return relay_can_overhear(rc->learn_members, h, child) && rc->t[h].direct_permille >= RC_HEAD_MIN_PERMILLE &&
 		!(p->expected >= 30U && p->heard == 0);
 }
 
@@ -1045,7 +1045,7 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 	unsigned idle = 0;
 	if (p->urgent) {
 		rc_apply_maintenance(c, p);
-		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
+		wire[RELAY_CONTROL_OFF_OWNERS] = wire[RELAY_CONTROL_OFF_OWNER_SECOND] = RELAY_OWNER_MAINTENANCE;
 		idle = 2;
 	}
 
@@ -1063,15 +1063,15 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 		uint16_t children = rc_take_records(&a, p->children[0][helper], &capacity);
 		if (capacity) children |= rc_take_records(&b, p->children[1][helper], &capacity);
 		if (capacity) children |= rc_take_records(&d, p->children[2][helper], &capacity);
-		wire[46 + idle] = helper;
-		relay_put_be16(wire + 51 + 2U * idle, children);
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = helper;
+		relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, children);
 		idle++;
 	}
 
 	unsigned repair_end = idle;
 	if (p->maintenance >= 0 && idle == 0) {
 		rc_apply_maintenance(c, p);
-		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
+		wire[RELAY_CONTROL_OFF_OWNERS] = wire[RELAY_CONTROL_OFF_OWNER_SECOND] = RELAY_OWNER_MAINTENANCE;
 		idle = 2;
 	}
 	c->survey = p->survey;
@@ -1087,32 +1087,32 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 		c->survey |= RC_BIT(child);
 	}
 	if (p->reporter >= 0 && idle < c->repair_count) {
-		wire[46 + idle++] = p->reporter;
+		wire[RELAY_CONTROL_OFF_OWNERS + idle++] = p->reporter;
 	}
 	/* Prefer a surveyed alternate over a same-helper retry in otherwise idle
 	 * capacity. Helpers retain refused records but suppress successful ones.
 	 * All distinct repairs, maintenance and reports keep their priority. */
 	unsigned retry = p->urgent ? 2U : 0U;
 	if (idle < c->repair_count && (c->missing[p->rescue_age] & p->rescue_child)) {
-		wire[46 + idle] = p->rescue_helper;
-		relay_put_be16(wire + 51 + 2U * idle, p->rescue_child);
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = p->rescue_helper;
+		relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, p->rescue_child);
 		/* A second distinct survey copy uses only another otherwise idle slot. */
 		if (++idle < c->repair_count && p->rescue_second < RC_MAX) {
-			wire[46 + idle] = p->rescue_second;
-			relay_put_be16(wire + 51 + 2U * idle, p->rescue_child);
+			wire[RELAY_CONTROL_OFF_OWNERS + idle] = p->rescue_second;
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, p->rescue_child);
 		}
 	} else if (idle < c->repair_count && retry < repair_end) {
-		wire[46 + idle] = wire[46 + retry];
-		wire[51 + 2U * idle] = wire[51 + 2U * retry];
-		wire[52 + 2U * idle] = wire[52 + 2U * retry];
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = wire[RELAY_CONTROL_OFF_OWNERS + retry];
+		wire[RELAY_CONTROL_OFF_CHILDREN + 2U * idle] = wire[RELAY_CONTROL_OFF_CHILDREN + 2U * retry];
+		wire[RELAY_CONTROL_OFF_CHILDREN_LOW + 2U * idle] = wire[RELAY_CONTROL_OFF_CHILDREN_LOW + 2U * retry];
 	}
 }
 
 void relay_coord_read_grants(struct relay_control *c, const uint8_t *wire)
 {
 	for (unsigned i = 0; i < c->repair_count; i++) {
-		c->grants[i].owner = wire[46 + i];
-		c->grants[i].children = relay_get_be16(wire + 51 + 2U * i);
+		c->grants[i].owner = wire[RELAY_CONTROL_OFF_OWNERS + i];
+		c->grants[i].children = relay_get_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * i);
 	}
 }
 
