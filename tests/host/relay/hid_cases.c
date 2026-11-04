@@ -216,13 +216,13 @@ static void test_fast_repair(void)
 	packet.length = relay_repair_encode(packet.data, &r);
 	esb_receive_repair(&packet, at + RELAY_V3_SLOT_TICKS);
 	CHECK(hid_count == 1);
-	relay_direct_pose[2] = true;
-	relay_direct_start[2] = relay_frame_start(relay_origin, 10) + 2 * RELAY_V3_SLOT_TICKS + 10;
-	esb_receive_normal(&source, relay_direct_start[2], false);
+	relay_direct_pose = true;
+	relay_direct_start = relay_frame_start(relay_origin, 10) + 2 * RELAY_V3_SLOT_TICKS + 10;
+	esb_receive_normal(&source, relay_direct_start, false);
 	CHECK(hid_count == 1);
 	source.data[16] = 0;
-	relay_direct_start[2] = relay_frame_start(relay_origin, 11) + 2 * RELAY_V3_SLOT_TICKS + 10;
-	esb_receive_normal(&source, relay_direct_start[2], false);
+	relay_direct_start = relay_frame_start(relay_origin, 11) + 2 * RELAY_V3_SLOT_TICKS + 10;
+	esb_receive_normal(&source, relay_direct_start, false);
 	CHECK(hid_count == 2);
 	r.helper = 0;
 	r.records[0].capture_frame = 9;
@@ -310,8 +310,8 @@ static void test_layout_frame_anchor(void)
 	/* A profile-1 layout publication clears grants, but not the clock grid. */
 	relay_grants=(struct relay_control){0};
 	tdma_active_mask=7;
-	relay_direct_pose[2]=true;
-	relay_direct_start[2]=relay_start_anchor+2*RELAY_V3_SLOT_TICKS+RELAY_V3_TX_OFFSET;
+	relay_direct_pose=true;
+	relay_direct_start=relay_start_anchor+2*RELAY_V3_SLOT_TICKS+RELAY_V3_TX_OFFSET;
 	struct esb_payload p; make_normal(&p,1,2,1,50);
 	esb_receive_normal(&p,0,false);
 	CHECK(relay_coord_was_published(&relay_coord,2,relay_frame_anchor));

@@ -79,7 +79,7 @@ static unsigned error_count;
 #define LOG_ERR(...) (error_count++, log_message(__VA_ARGS__))
 #define LOG_INF(...) log_message(__VA_ARGS__)
 
-struct esb_payload { uint8_t length, pipe; bool noack; int8_t rssi; uint8_t data[64]; };
+struct esb_payload { uint8_t length, pipe; bool noack; int8_t rssi; uint8_t data[64]; uint32_t rx_ticks, rx_context; bool rx_pose; };
 struct esb_evt { int evt_id; unsigned tx_attempts; };
 /* PRODUCTION STATE */
 static uint32_t decision_ready_mask, decision_fence_mask;
@@ -350,6 +350,7 @@ static struct esb_payload ack_for(const struct esb_payload *p, bool *has_ack)
 static void dispatch(const struct esb_payload *p)
 {
     incoming = *p;
+    incoming.rx_ticks = now_ticks;
     incoming_ready = true;
     const struct esb_evt event = {.evt_id = ESB_EVENT_RX_RECEIVED};
     event_handler(&event);
@@ -750,6 +751,7 @@ static void test_detailed_warning(void)
 static void fifo_push(struct esb_payload p, uint32_t ticks)
 {
     assert(fifo_count < 32);
+    p.rx_ticks = ticks;
     fifo[fifo_count] = p;
     fifo_ticks[fifo_count++] = ticks;
 }
@@ -830,7 +832,7 @@ static void test_drain(void)
     event_handler(&rx);
     assert(fifo_next == 23 && fifo_count == 23);
 #if defined(CONFIG_TDMA_DIAGNOSTICS)
-    assert(tick_reads == 23 && event_tick_reads == 23);
+    assert(tick_reads == 0 && event_tick_reads == 0);
 #else
     assert(tick_reads == 0 && event_tick_reads == 0);
 #endif

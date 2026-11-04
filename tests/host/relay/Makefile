@@ -5,6 +5,7 @@ TMP := $(shell mktemp -d 2>/dev/null || echo /tmp/relay-host)
 
 .PHONY: check clean
 check:
+	python3 run_rx_metadata.py
 	python3 run_fatal.py
 	python3 run_rtc_alloc.py
 	CC="$(CC)" python3 run_ledger_mask.py
