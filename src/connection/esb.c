@@ -653,6 +653,20 @@ static uint32_t relay_session;
 static struct relay_control relay_grants;
 static bool relay_repair_delivery;
 static uint32_t relay_learn_lock_max;
+#ifdef CONFIG_RELAY_IRQ_DIAGNOSTICS
+static uint32_t irq_probe_plan_max, irq_probe_plan_count;
+static uint32_t irq_probe_tick_max, irq_probe_tick_count;
+#define IRQ_PROBE_BEGIN(name) uint32_t irq_probe_start_##name = DWT->CYCCNT
+#define IRQ_PROBE_END(name) do { \
+    uint32_t elapsed = DWT->CYCCNT - irq_probe_start_##name; \
+    irq_probe_##name##_max = MAX(irq_probe_##name##_max, elapsed); \
+    irq_probe_##name##_count++; \
+} while (0)
+#else
+#define IRQ_PROBE_BEGIN(name)
+#define IRQ_PROBE_END(name)
+#endif
+
 static uint32_t relay_b_sent, relay_b_failed;
 /* B timing, ticks: launch past preamble - TX_OFFSET (count, max), plan and grant work (max). */
 static uint32_t relay_b_late, relay_b_late_max, relay_b_plan_max, relay_b_grant_max;
@@ -1911,10 +1925,12 @@ static void esb_stats_thread(void)
 		{
 			bool relay_enabled = relay_user_enabled && !esb_ota_relay_is_active();
 			unsigned int relay_key = irq_lock();
+			IRQ_PROBE_BEGIN(tick);
 			if (relay_enabled != relay_coord.enabled) {
 				relay_coord_set_enabled(&relay_coord, relay_enabled);
 			}
 			(void)relay_coord_tick(&relay_coord, (uint16_t)tdma_active_mask, k_uptime_get_32());
+			IRQ_PROBE_END(tick);
 			irq_unlock(relay_key);
 		}
 
@@ -2155,7 +2171,7 @@ static void esb_receive_relay_diag(const struct esb_payload *payload)
 
 static int relay_coord_init_once(void)
 {
-#ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
+#if defined(CONFIG_RELAY_CYCLE_DIAGNOSTICS) || defined(CONFIG_RELAY_IRQ_DIAGNOSTICS)
 	CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
 	DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 #endif
@@ -5573,6 +5589,13 @@ void esb_relay_print_pool(void)
 
 void esb_relay_print_status(void)
 {
+#ifdef CONFIG_RELAY_IRQ_DIAGNOSTICS
+    unsigned probe_key = irq_lock();
+    uint32_t pm = irq_probe_plan_max, pc = irq_probe_plan_count;
+    uint32_t tm = irq_probe_tick_max, tc = irq_probe_tick_count;
+    irq_unlock(probe_key);
+    printk("irq_probe plan count=%u max=%u tick count=%u max=%u cycles\n", pc, pm, tc, tm);
+#endif
 	static struct relay_coord snapshot;
 	/* Diagnostic rows need not share one instant. Bound interrupt masking
 	 * while copying the large coordinator, so querying it cannot delay B. */
@@ -5830,6 +5853,7 @@ static void relay_broadcast_thread(void)
 	uint8_t epoch = 0;
 	for (;;) {
 		unsigned key = irq_lock();
+		IRQ_PROBE_BEGIN(plan);
 		bool active = esb_initialized && relay_profile && !esb_pairing
 			&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask);
 		uint32_t origin = relay_origin;
@@ -5839,6 +5863,7 @@ static void relay_broadcast_thread(void)
 		relay_frame_anchor = frame;
 		relay_start_anchor = preamble - RELAY_V3_B_PREAMBLE;
 		if (!active || (sent == frame && epoch == relay_epoch)) {
+			IRQ_PROBE_END(plan);
 			irq_unlock(key);
 			k_usleep(200);
 			continue;
@@ -5847,6 +5872,7 @@ static void relay_broadcast_thread(void)
 		 * the freeze. With 11 members planning takes up to ~0.4 ms. */
 		int32_t lead = preamble - now;
 		if (lead < 8 || lead > 120) {
+			IRQ_PROBE_END(plan);
 			irq_unlock(key);
 			k_usleep(lead > 120 ? k_ticks_to_us_floor32(lead - 120) : 100);
 			continue;
@@ -5882,6 +5908,7 @@ static void relay_broadcast_thread(void)
 		}
 		sent = frame;
 		epoch = control.epoch;
+		IRQ_PROBE_END(plan);
 		irq_unlock(key);
 		if (schedule_err || !wire) {
 			relay_b_failed++;

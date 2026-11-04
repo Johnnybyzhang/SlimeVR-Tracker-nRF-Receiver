@@ -64,6 +64,8 @@ static bool esb_ota_relay_is_active(void){return false;}
 static unsigned irq_lock(void){return 0;}
 static void irq_unlock(unsigned key){(void)key;}
 static uint32_t k_uptime_get_32(void){return 500;}
+#define IRQ_PROBE_BEGIN(name)
+#define IRQ_PROBE_END(name)
 #define relay_coord_set_enabled(c,e) ((c)->enabled=(e))
 #define relay_coord_tick(c,m,t) (proof_updates++)
 static void relay_learn_update(uint32_t now){assert(now==500);choice_updates=proof_updates;}
