@@ -3152,32 +3152,42 @@ struct relay_hid_record {
 	uint8_t rssi;
 };
 K_MSGQ_DEFINE(relay_hid_queue, sizeof(struct relay_hid_record), 128, 4);
-static uint32_t relay_hid_overflow;
+static uint32_t relay_hid_overflow, relay_hid_dropped_output, relay_hid_enqueued, relay_hid_refused;
 
 static void relay_hid_packet(const uint8_t *data, uint8_t rssi)
 {
 	struct relay_hid_record record = {.rssi = rssi};
 	memcpy(record.data, data, sizeof(record.data));
 	if (k_msgq_put(&relay_hid_queue, &record, K_NO_WAIT)) {
-		/* Backpressure must not silently drop an accepted pose. */
-		struct relay_hid_record pending;
-		while (!k_msgq_get(&relay_hid_queue, &pending, K_NO_WAIT)) {
-			hid_write_packet_n(pending.data, pending.rssi);
-		}
+		/* USB can stall indefinitely. Drop this newest output in bounded ISR
+		 * work; RF acceptance and deadlines do not depend on USB progress. */
 		relay_hid_overflow++;
-		hid_write_packet_n(record.data, record.rssi);
+		relay_hid_dropped_output++;
 	}
+}
+
+/* Worker retains one record until downstream accepts it, preserving order. */
+static bool relay_hid_step(struct relay_hid_record *record, bool *pending)
+{
+	if (!*pending) {
+		if (k_msgq_get(&relay_hid_queue, record, K_NO_WAIT)) return false;
+		*pending = true;
+	}
+	if (!hid_try_write_packet_n(record->data, record->rssi)) {
+		relay_hid_refused++;
+		return false;
+	}
+	relay_hid_enqueued++;
+	*pending = false;
+	return true;
 }
 
 static void relay_hid_thread(void)
 {
 	struct relay_hid_record record;
+	bool pending = false;
 	for (;;) {
-		unsigned key = irq_lock();
-		int err = k_msgq_get(&relay_hid_queue, &record, K_NO_WAIT);
-		if (!err) hid_write_packet_n(record.data, record.rssi);
-		irq_unlock(key);
-		if (err) k_usleep(200);
+		if (!relay_hid_step(&record, &pending)) k_usleep(200);
 	}
 }
 K_THREAD_DEFINE(relay_hid_thread_id, 768, relay_hid_thread, NULL, NULL, NULL, 3, 0, 0);
@@ -5592,13 +5602,15 @@ void esb_relay_print_status(void)
 	printk("relay: B late=%u late_max=%u plan_max=%u grant_max=%u ticks\n", relay_b_late,
 		relay_b_late_max, relay_b_plan_max, relay_b_grant_max);
 	printk("relay: learning irq_max=%u ticks\n", relay_learn_lock_max);
+	printk("relay: HID enqueued=%u refused_attempts=%u dropped_output=%u overflow=%u\n",
+		relay_hid_enqueued, relay_hid_refused, relay_hid_dropped_output, relay_hid_overflow);
 #ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
 	printk("relay: B entry_late=%u entry_max=%u ticks encode_max=%u cycles\n",
 		relay_b_entry_late, relay_b_entry_max, relay_b_encode_cycles_max);
-	printk("relay: B freeze_arm_max=%u cycles; RX max=%u avg=%u cycles packets=%u HID_overflow=%u learning_overflow=%u\n",
+	printk("relay: B freeze_arm_max=%u cycles; RX max=%u avg=%u cycles packets=%u HID_overflow=%u learning_overflow=%u HID_dropped_output=%u HID_enqueued=%u HID_refused=%u\n",
 		relay_b_arm_cycles_max, rx_max,
 		rx_packets ? (uint32_t)(rx_cycles / rx_packets) : 0,
-		rx_packets, relay_hid_overflow, relay_learning_overflow);
+		rx_packets, relay_hid_overflow, relay_learning_overflow, relay_hid_dropped_output, relay_hid_enqueued, relay_hid_refused);
 
 #endif
 #if defined(CONFIG_TDMA_DIAGNOSTICS)

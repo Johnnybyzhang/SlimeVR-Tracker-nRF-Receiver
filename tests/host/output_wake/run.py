@@ -145,7 +145,7 @@ hid_functions = '\n'.join(function(hid_source, name) for name in [
     'int_in_ready_cb', 'input_report_done_cb', 'iface_ready_cb',
     'report_event_handler', 'hid_usb_state_changed', 'composite_pre_init',
     'hid_type_byte1_is_tracker_id', 'hid_type_has_rssi_slot',
-    'hid_enqueue_packet', 'hid_write_tracker_event', 'hid_write_packet_n'])
+    'hid_enqueue_packet', 'hid_write_tracker_event', 'hid_try_write_packet_n', 'hid_write_packet_n'])
 hid = common + r'''
 #define RCV_HID_TYPE_CMD_ACK 251
 #define RCV_HID_TYPE_CMD 254

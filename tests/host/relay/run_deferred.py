@@ -34,13 +34,22 @@ static struct relay_coord relay_coord;
 static uint32_t relay_session=42;
 static uint8_t relay_epoch=3;
 static unsigned hid_count;
-static void hid_write_packet_n(const uint8_t *data,uint8_t rssi){assert(data[0]==hid_count++);assert(rssi==50);}
+static bool stalled;
+static bool hid_try_write_packet_n(const uint8_t *data,uint8_t rssi){if(stalled)return false;assert(data[0]==hid_count++);assert(rssi==50);return true;}
 '''
 cases = r'''
 int main(void) {
  relay_coord_init(&relay_coord);
  for(unsigned i=0;i<129;i++){uint8_t p[16]={i};relay_hid_packet(p,50);p[0]=0;}
- assert(hid_count==129 && relay_hid_overflow==1 && !relay_hid_queue.count);
+ assert(hid_count==0 && relay_hid_overflow==1 && relay_hid_dropped_output==1 && relay_hid_queue.count==128);
+ struct relay_hid_record output;bool pending=false;stalled=true;
+ assert(!relay_hid_step(&output,&pending)&&pending&&output.data[0]==0);
+ assert(!relay_hid_step(&output,&pending)&&pending&&relay_hid_queue.count==127);
+ uint8_t newer[16]={128};relay_hid_packet(newer,50);
+ stalled=false;
+ for(unsigned i=0;i<129;i++)assert(relay_hid_step(&output,&pending));
+ assert(hid_count==129 && relay_hid_enqueued==129 && relay_hid_refused==2 && !pending);
+ assert(!relay_hid_step(&output,&pending));
  for(unsigned i=0;i<17;i++)relay_defer_capture(&relay_coord,1,2,50,100+i);
  assert(relay_learning_overflow==1 && relay_coord.peer[1][2].evidence_ms==116);
  struct relay_control c={.session=42,.epoch=3,.members=2,.repair_count=5};
