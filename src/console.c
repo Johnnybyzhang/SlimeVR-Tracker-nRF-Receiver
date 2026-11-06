@@ -373,6 +373,32 @@ static inline void strtolower(char *str)
 	}
 }
 
+/* Console feedback is retained even when ledger event calls compile away. */
+static void console_relay_ledger(const char *text, bool mask)
+{
+#ifdef CONFIG_RELAY_FRAME_LEDGER
+	if (!mask && strcmp(text, "dump") == 0) {
+		ledger_command(-1);
+		return;
+	}
+	char *end;
+	unsigned long value = strtoul(text, &end, 0);
+	if (!*text || *end || value > (mask ? UINT16_MAX : RELAY_MAX_TRACKERS - 1U)) {
+		printk("LEDGER invalid %s\n", mask ? "mask" : "child");
+		return;
+	}
+	if (mask) {
+		ledger_command_mask((uint16_t)value);
+	} else {
+		ledger_command((int)value);
+	}
+#else
+	(void)text;
+	(void)mask;
+	printk("ledger unavailable in this image\n");
+#endif
+}
+
 static bool parse_u8_arg(const char *str, uint8_t *value)
 {
 	char *endptr = NULL;
@@ -1045,6 +1071,10 @@ static void console_thread(void)
 						"<max_trackers|max_repairs|repair_floor|second_b|slot_ticks|tps_min|tps_max> <value>\n"
 					);
 				}
+			} else if (argc == 3 && strcmp(arg, "ledgermask") == 0) {
+				console_relay_ledger(arg2, true);
+			} else if (argc == 3 && strcmp(arg, "ledger") == 0) {
+				console_relay_ledger(arg2, false);
 			} else if (argc == 2 && strcmp(arg, "pool") == 0) {
 				esb_relay_print_pool();
 			} else if (argc == 1) {

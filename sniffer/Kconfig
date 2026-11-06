@@ -1,0 +1,2 @@
+mainmenu "Passive relay sniffer"
+source "Kconfig.zephyr"

@@ -33,6 +33,7 @@ check:
 	python3 run_rx_metadata.py
 	python3 run_fatal.py
 	python3 run_rtc_alloc.py
+	CC="$(CC)" python3 run_ledger_mask.py
 	$(CC) $(CFLAGS) test_rescue.c $(SRC)/relay_coord.c -o $(TMP)/test_rescue
 	$(TMP)/test_rescue
 	$(CC) $(CFLAGS) test_split.c $(SRC)/relay_coord.c -o $(TMP)/test_split

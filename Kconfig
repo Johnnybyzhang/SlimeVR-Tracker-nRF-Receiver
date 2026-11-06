@@ -178,6 +178,13 @@ config RELAY_RESCUE_DIAGNOSTICS
     default n
     depends on RELAY_FRAME_LEDGER
 
+config RELAY_FRAME_LEDGER
+    bool "Bounded per-frame relay ledger"
+    default n
+    help
+        Retain local relay events in RAM for post-capture console inspection.
+        Diagnostic images only; no logging or formatting in radio paths.
+
 config RELAY_CYCLE_DIAGNOSTICS
     bool "Detailed relay CPU cycle diagnostics"
     depends on CPU_CORTEX_M_HAS_DWT
