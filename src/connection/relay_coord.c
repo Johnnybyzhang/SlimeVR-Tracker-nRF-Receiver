@@ -1,3 +1,6 @@
+#ifdef CONFIG_RELAY_RESCUE_DIAGNOSTICS
+#include "frame_ledger.h"
+#endif
 /* Receiver-side relay coordinator. Pure policy; see relay_coord.h. */
 #include "relay_coord.h"
 
@@ -76,7 +79,7 @@ void relay_coord_forget(struct relay_coord *rc, uint8_t id, uint32_t now_ms)
 	rc_release_child(rc, id);
 	rc_release_head(rc, id);
 	rc->published_valid &= ~(1U << id);
-	for (unsigned i = 0; i < RELAY_V3_CACHE_FRAMES; i++) {
+	for (unsigned i = 0; i < RELAY_CACHE_MAX_FRAMES; i++) {
 		rc->receipt[i].received &= ~(1U << id);
 	}
 	bool fwd = rc->t[id].fwd_wanted || rc->t[id].fwd_revoking;
@@ -554,9 +557,7 @@ void relay_coord_pin(struct relay_coord *rc, uint8_t id, bool pinned)
 
 bool relay_coord_v3_ready(const struct relay_coord *rc, uint16_t members)
 {
-	if (!rc->enabled || !rc->v3_requested
-	    || !relay_profile_valid(RELAY_PROFILE_120HZ, members, members, RELAY_V3_SLOT_TICKS,
-		RELAY_V3_REPAIR_SLOTS)) {
+	if (!rc->enabled || !rc->v3_requested || !members) {
 		return false;
 	}
 	for (uint8_t id = 0; id < RC_MAX; id++) {
@@ -586,7 +587,7 @@ void relay_coord_receive(struct relay_coord *rc, uint8_t id, uint32_t frame)
 #ifdef __ZEPHYR__
 	unsigned key = irq_lock();
 #endif
-	struct rc_receipt *r = &rc->receipt[frame % RELAY_V3_CACHE_FRAMES];
+	struct rc_receipt *r = &rc->receipt[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
 	if (r->frame != frame) {
 		r->frame = frame;
 		r->received = 0;
@@ -860,13 +861,37 @@ static uint16_t rc_watch_helpers(const struct rc_watch *w, unsigned child)
 	return helpers;
 }
 
-static bool rc_rescue_better(const struct relay_coord *rc, uint16_t tried,
-	unsigned child, unsigned h, int incumbent, const uint8_t *load)
+static bool rc_narrow_pool(const struct relay_control *c)
+{
+	return c->repair_count <= 3U;
+}
+
+static bool rc_rescue_better(
+	const struct relay_coord *rc,
+	bool narrow,
+	uint16_t tried,
+	unsigned child,
+	unsigned h,
+	int incumbent,
+	const uint8_t *load
+)
 {
 	if (incumbent < 0) return true;
 	bool old = (tried & RC_BIT(incumbent)) != 0;
 	bool retry = (tried & RC_BIT(h)) != 0;
-	return old != retry ? old : rc_better(rc, child, h, incumbent, load);
+	if (old != retry) {
+		return old;
+	}
+	if (narrow) {
+		/* Rescue capacity needs the best measured copy probability. Do not trade
+		 * several percent of capture for a small RSSI advantage at last chance. */
+		unsigned candidate = relay_coord_peer_ratio(&rc->peer[h][child]);
+		unsigned previous = relay_coord_peer_ratio(&rc->peer[incumbent][child]);
+		if (candidate != previous) {
+			return candidate > previous;
+		}
+	}
+	return rc_better(rc, child, h, incumbent, load);
 }
 
 /* Capture history is permission to listen, not proof of capture. Try up to two eligible
@@ -875,30 +900,50 @@ static bool rc_rescue_better(const struct relay_coord *rc, uint16_t tried,
 static void rc_plan_rescue(const struct relay_coord *rc, const struct relay_control *c,
 	struct rc_grant_plan *p)
 {
-	for (unsigned remaining = RELAY_V3_CACHE_FRAMES; remaining > 0; remaining--) {
+	for (unsigned remaining = relay_control_cache_frames(c); remaining > 0; remaining--) {
 		unsigned age = remaining - 1U;
 		uint32_t frame = c->frame - age;
-		const struct rc_watch *w = &rc->watch[frame % RELAY_V3_CACHE_FRAMES];
-		const struct rc_receipt *r = &rc->receipt[frame % RELAY_V3_CACHE_FRAMES];
+		const struct rc_watch *w = &rc->watch[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
+		const struct rc_receipt *r = &rc->receipt[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
 		if (w->frame != frame || w->session != c->session || w->epoch != c->epoch ||
 		    w->members != c->members) continue;
 		uint16_t missing = c->expected & ~(r->frame == frame ? r->received : 0);
+		unsigned first = 0;
+		uint16_t tail = missing;
+		if (rc_narrow_pool(c)) {
+			/* A narrow pool cannot leave the same later-ID child behind on every
+			 * tied deadline. Rotate the first rescue among the missing children. */
+			uint16_t pivot = missing;
+			unsigned rank = missing ? c->frame % relay_mask_count(missing) : 0;
+			while (rank--) {
+				pivot &= pivot - 1U;
+			}
+			first = pivot ? __builtin_ctz((unsigned)pivot) : 0;
+			tail = missing & (uint16_t)(0xffffU << first);
+		}
 		while (missing) {
-			unsigned child = __builtin_ctz((unsigned)missing);
-			missing &= missing - 1U;
+			unsigned child;
+			if (rc_narrow_pool(c)) {
+				child = __builtin_ctz((unsigned)(tail ? tail : missing));
+				missing &= ~RC_BIT(child);
+				tail &= ~RC_BIT(child);
+			} else {
+				child = __builtin_ctz((unsigned)missing);
+				missing &= missing - 1U;
+			}
 			uint16_t listeners = w->listeners[child] | rc_watch_helpers(w, child);
 			int best = -1, second = -1;
-			uint16_t tried = (w->rescue_child & RC_BIT(child)) ? w->rescue_helpers : 0;
+			uint16_t tried = w->rescue_tried[child];
 			const uint8_t load[RC_MAX] = {0};
 			for (unsigned h = 0; h < RC_MAX; h++) {
 				if (!(listeners & RC_BIT(h)) ||
 				    ((w->primary_valid & RC_BIT(child)) && (w->helpers[child] & 15U) == h) ||
 				    ((w->backup_valid & RC_BIT(child)) && (w->helpers[child] >> 4) == h) ||
 				    !relay_can_overhear(w->members, h, child) || !rc_listener(rc, child, h)) continue;
-				if (rc_rescue_better(rc, tried, child, h, best, load)) {
+				if (rc_rescue_better(rc, rc_narrow_pool(c), tried, child, h, best, load)) {
 					second = best;
 					best = h;
-				} else if (rc_rescue_better(rc, tried, child, h, second, load)) {
+				} else if (rc_rescue_better(rc, rc_narrow_pool(c), tried, child, h, second, load)) {
 					second = h;
 				}
 			}
@@ -913,11 +958,104 @@ static void rc_plan_rescue(const struct relay_coord *rc, const struct relay_cont
 	}
 }
 
+/* Reserve a late opportunity for the oldest debt. A holder that previously
+ * raced R0 gets a retry after preparation time; otherwise try the qualified
+ * alternate already selected by rescue planning. Coverage is permission from
+ * the capture-frame watch, never an assumption that the cache holds a copy. */
+static void rc_plan_emergency(const struct relay_coord *rc, const struct relay_control *c, struct rc_grant_plan *p)
+{
+	const unsigned age = relay_control_cache_frames(c) - 1U;
+	const struct rc_watch *w = &rc->watch[(c->frame - age) % (rc->cache_frames ? rc->cache_frames : 3U)];
+	if (!p->rescue_child || p->rescue_age != age) {
+		return;
+	}
+	unsigned child = __builtin_ctz((unsigned)p->rescue_child);
+	unsigned helper = p->rescue_helper;
+	int retry = -1;
+	const uint8_t load[RC_MAX] = {0};
+	for (unsigned h = 0; h < RC_MAX; h++) {
+		if (!(w->r0_only[child] & RC_BIT(h)) || !relay_can_overhear(w->members, h, child)
+			|| !rc_listener(rc, child, h)) {
+			continue;
+		}
+		if (retry < 0 || rc_better(rc, child, h, retry, load)) {
+			retry = h;
+		}
+	}
+	if (retry >= 0) {
+		helper = retry;
+	}
+	p->emergency_child = p->rescue_child;
+	p->emergency_helper = helper;
+	for (unsigned ch = 0; ch < RC_MAX; ch++) {
+		if (!(c->expected & RC_BIT(ch)) || !relay_can_overhear(w->members, helper, ch)
+			|| !rc_listener(rc, ch, helper)) {
+			continue;
+		}
+		if ((w->listeners[ch] | rc_watch_helpers(w, ch)) & RC_BIT(helper)) {
+			p->emergency_coverage |= RC_BIT(ch);
+		}
+	}
+	p->emergency_coverage |= p->emergency_child;
+}
+
+/* Diagnostic only, before freeze. Flags: listener, primary, backup,
+ * topology, uplink, silent, tried, eligible, selected, other choice. Rank
+ * includes ineligible peers so the historical ordering can be reconstructed. */
+#ifdef CONFIG_RELAY_RESCUE_DIAGNOSTICS
+static void
+rc_rescue_diagnose(const struct relay_coord *rc, const struct relay_control *c, const struct rc_grant_plan *p)
+{
+	const uint8_t load[RC_MAX] = {0};
+	for (unsigned age = 0; age < relay_control_cache_frames(c); age++) {
+		uint32_t frame = c->frame - age;
+		const struct rc_watch *w = &rc->watch[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
+		const struct rc_receipt *r = &rc->receipt[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
+		if (w->frame != frame || w->session != c->session || w->epoch != c->epoch || w->members != c->members) {
+			continue;
+		}
+		uint16_t missing = c->expected & ~(r->frame == frame ? r->received : 0);
+		for (unsigned child = 0; child < RC_MAX; child++) {
+			if (!(missing & RC_BIT(child)) || !ledger_child_enabled(child)) {
+				continue;
+			}
+			uint16_t listeners = w->listeners[child] | rc_watch_helpers(w, child);
+			uint16_t tried = w->rescue_tried[child];
+			for (unsigned h = 0; h < RC_MAX; h++) {
+				bool listener = listeners & RC_BIT(h);
+				bool primary = (w->primary_valid & RC_BIT(child)) && (w->helpers[child] & 15U) == h;
+				bool backup = (w->backup_valid & RC_BIT(child)) && (w->helpers[child] >> 4) == h;
+				bool topology
+					= relay_can_overhear(w->members, h, child) && relay_can_overhear(rc->learn_members, h, child);
+				bool uplink = rc->t[h].direct_permille >= RC_HEAD_MIN_PERMILLE;
+				bool silent = rc->peer[h][child].expected >= 30U && rc->peer[h][child].heard == 0;
+				bool eligible = listener && !primary && !backup && topology && uplink && !silent;
+				bool choice = p->rescue_child == RC_BIT(child) && p->rescue_age == age;
+				unsigned flags = listener | (primary << 1) | (backup << 2) | (topology << 3) | (uplink << 4)
+							   | (silent << 5) | (!!(tried & RC_BIT(h)) << 6) | (eligible << 7)
+							   | (choice && (p->rescue_helper == h || p->rescue_second == h) ? 256U : 0U)
+							   | (p->rescue_child && !choice ? 512U : 0U);
+				unsigned rank = 0;
+				for (unsigned j = 0; j < RC_MAX; j++) {
+					if (j != h && rc_rescue_better(rc, rc_narrow_pool(c), tried, child, j, h, load)) {
+						rank++;
+					}
+				}
+				ledger_note(c->session, frame, child, LEDGER_CANDIDATE_FLAGS, flags, h, age);
+				ledger_note(c->session, frame, child, LEDGER_CANDIDATE_UPLINK, rc->t[h].direct_permille, h, age);
+				ledger_note(c->session, frame, child, LEDGER_CANDIDATE_RANK, rank, h, age);
+			}
+		}
+	}
+}
+#endif
+
+static void rc_finish_demand(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire);
 /* Selection scans run before the mask freeze. Ties retain rotation order. */
 void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 	struct rc_grant_plan *p, uint32_t now_ms)
 {
-	for (unsigned i = 0; i < c->repair_count; i++) {
+	for (unsigned i = 0; i < RELAY_V3_REPAIR_MAX; i++) {
 		c->grants[i] = (struct relay_grant){.owner = RELAY_OWNER_IDLE};
 	}
 	c->maintenance_owner = RELAY_OWNER_IDLE;
@@ -950,9 +1088,9 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 		if (c->backup_valid & RC_BIT(child))
 			p->next_listeners[child] |= RC_BIT(c->helpers[child] >> 4);
 	}
-	for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES - 1U; age++) {
+	for (unsigned age = 0; age < 2U; age++) {
 		uint32_t frame = c->frame - age;
-		const struct rc_watch *w = &rc->watch[frame % RELAY_V3_CACHE_FRAMES];
+		const struct rc_watch *w = &rc->watch[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
 		if (w->frame != frame || w->session != c->session || w->epoch != c->epoch ||
 		    w->members != c->members) continue;
 		for (unsigned child = 0; child < RC_MAX; child++)
@@ -963,7 +1101,17 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 	p->fresh_survey |= ~(c->primary_valid | c->backup_valid);
 	p->fresh_survey &= c->members;
 	rc_plan_rescue(rc, c, p);
-	p->urgent = oldest_m >= RC_MAINTENANCE_URGENT_MS;
+	if (rc_narrow_pool(c)) {
+		rc_plan_emergency(rc, c, p);
+	}
+#ifdef CONFIG_RELAY_RESCUE_DIAGNOSTICS
+	rc_rescue_diagnose(rc, c, p);
+#endif
+	if (c->repair_count < 2U) {
+		p->maintenance = -1;
+	}
+	p->urgent = p->maintenance >= 0
+			 && (oldest_m >= RC_MAINTENANCE_URGENT_MS || (c->on_demand && c->repair_count >= 2 && c->frame % 8U == 0));
 	if (c->frame % 10U == 0) {
 		for (unsigned n = 0; n < RC_MAX; n++) {
 			unsigned child = (rc->survey_next + n) % RC_MAX;
@@ -982,33 +1130,105 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 		for (unsigned n = 0; n < RC_MAX; n++) {
 			unsigned child = (rc->survey_next + n) % RC_MAX;
 			unsigned direct = rc->t[child].direct_permille;
-			if ((c->members & RC_BIT(child)) && direct && direct < weakest) {
+			if ((c->members & RC_BIT(child)) && (direct || (c->expected & RC_BIT(child))) && direct < weakest) {
 				weakest = direct;
 				p->survey = RC_BIT(child);
 			}
 		}
 		p->survey_next = rc->survey_next;
+		/* A fully blocked but active source still needs listening coverage.
+		 * Rotate zero-direct ties so simultaneous drops share that coverage. */
+		if (p->survey && weakest == 0) {
+			p->survey_next = (__builtin_ctz((unsigned)p->survey) + 1U) % RC_MAX;
+		}
 	}
-	for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
+	for (unsigned age = 0; age < relay_control_cache_frames(c); age++) {
 		uint32_t frame = c->frame - age;
-		const struct rc_watch *w = &rc->watch[frame % RELAY_V3_CACHE_FRAMES];
-		p->receipt_index[age] = frame % RELAY_V3_CACHE_FRAMES;
+		const struct rc_watch *w = &rc->watch[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
+		p->receipt_index[age] = frame % (rc->cache_frames ? rc->cache_frames : 3U);
 		if (w->frame == frame) {
-			p->watch[age] = *w;
+			*relay_plan_watch(p, age) = *w;
+			if (c->on_demand) {
+				for (unsigned ch = 0; ch < RC_MAX; ch++) {
+					uint16_t holders = w->listeners[ch] | rc_watch_helpers(w, ch);
+					for (unsigned h = 0; h < RC_MAX; h++) {
+						if ((holders & RC_BIT(h)) && rc_listener(rc, ch, h)) {
+							p->demand_eligible[age] |= RC_BIT(ch);
+							if (!age) {
+								p->fresh_helper[ch] = h;
+								p->fresh_coverage[h] |= RC_BIT(ch);
+							}
+							break;
+						}
+					}
+				}
+			}
+
 			p->valid |= 1U << age;
 			for (unsigned copy = 0; copy < 2; copy++) {
 				uint16_t children = copy ? w->backup_valid : w->primary_valid;
 				while (children) {
 					unsigned child = __builtin_ctz((unsigned)children);
 					children &= children - 1U;
-					unsigned h = (w->helpers[child] >> (copy * 4U)) & 15U;
-					unsigned position = (copy * 3U + 2U - age) * 16U + child;
+					/* On an aged miss, alternate the lead lane when both original
+					 * reservations exist. The primary then gets a later slot
+					 * instead of repeatedly racing R0 with retained records.
+					 * Even frames lead with backup, odd frames with primary.
+					 * Fresh repairs and single-helper records keep their order. */
+					unsigned selected_copy
+						= age && !(c->frame & 1U) && (w->primary_valid & w->backup_valid & RC_BIT(child)) ? 1U - copy
+																										  : copy;
+					unsigned h = (w->helpers[child] >> (selected_copy * 4U)) & 15U;
+					/* The planned alternate must not wait behind another failed
+					 * reservation for this exact retained frame. Reuse the one
+					 * existing rescue search; keep the other original lane. */
+					if (age && !copy && p->rescue_age == age && p->rescue_child == RC_BIT(child)
+						&& (w->rescue_tried[child] & RC_BIT(h))
+						&& !(w->rescue_tried[child] & RC_BIT(p->rescue_helper))) {
+						h = p->rescue_helper;
+					}
+					if (c->on_demand) {
+						unsigned lane = 4U - age, bit = copy * 16U + child;
+						p->demand_helper[lane][bit] = h;
+						p->demand_children[lane][h] |= 1U << bit;
+						p->demand_candidates[lane] |= 1U << bit;
+						continue;
+					}
+					unsigned position;
+					if (rc_narrow_pool(c)) {
+						/* A narrow pool must try the backup of an expiring record
+						 * before spending its remaining capacity on younger work. */
+						position = ((2U - age) * 2U + copy) * RC_MAX + child;
+					} else {
+						position = (copy * 3U + 2U - age) * 16U + child;
+					}
 					p->helper[position / 32U][position % 32U] = h;
 					p->children[position / 32U][h] |= 1U << (position % 32U);
 					p->candidates[position / 32U] |= 1U << (position % 32U);
 				}
 			}
 		}
+	}
+	if (c->on_demand) {
+		for (unsigned age = 0; age < 5; age++) {
+			const struct rc_receipt *r = &rc->receipt[p->receipt_index[age]];
+			relay_control_missing(c, age) = c->expected & ~(r->frame == c->frame - age ? r->received : 0);
+		}
+		/* A two-slot maintenance exchange must not consume the last repair
+		 * capacity for retained qualified poses. It resumes once both fit. */
+		uint16_t aged = 0;
+		for (unsigned age = 1; age < 5; age++) {
+			aged |= relay_control_missing(c, age) & p->demand_eligible[age];
+		}
+		if (aged && c->repair_count < relay_mask_count(aged) + 2U) {
+			p->maintenance = -1;
+			p->urgent = false;
+		}
+
+		uint8_t wire[72];
+		relay_control_encode(wire, c);
+		rc_finish_demand(c, p, wire);
+		relay_coord_read_grants(c, wire);
 	}
 }
 
@@ -1017,7 +1237,8 @@ static void rc_apply_maintenance(struct relay_control *c,
 {
 	c->maintenance_owner = p->maintenance;
 	c->flags |= RELAY_CONTROL_MAINTENANCE;
-	c->grants[0] = c->grants[1] = (struct relay_grant){.owner = RELAY_OWNER_MAINTENANCE};
+	c->grants[0] = (struct relay_grant){.owner = RELAY_OWNER_MAINTENANCE};
+	c->grants[1] = c->grants[0];
 }
 
 /* Attribute provenance: Frozen allocator is included in linked 10,000-payload equivalence and round 11 encode-cycle evidence. Retain its call/placement boundary. */
@@ -1039,7 +1260,9 @@ static inline __attribute__((always_inline)) uint16_t rc_take_records(uint32_t *
 /* Attribute provenance: Frozen allocator is included in linked 10,000-payload equivalence and round 11 encode-cycle evidence. Retain its call/placement boundary. */
 __attribute__((optimize("O3")))
 #endif
-__ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
+/* Keep the full-pool load placement at its measured baseline. */
+#define RC_GRANT_LIMIT limit
+static __ramfunc void rc_finish_full(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
 {
 
 	unsigned idle = 0;
@@ -1049,7 +1272,8 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 		idle = 2;
 	}
 
-	/* Ordered candidates: primary oldest first, then backup oldest first.
+	/* Full pool: primary oldest first, then backup oldest first.
+	 * Narrow pool: both lanes of an older deadline precede younger work.
 	 * Fill one helper's next three records ahead of the scan. Removing those
 	 * records leaves exactly the next slot-opening record of the single-pass
 	 * algorithm, including a fourth record for the same helper. */
@@ -1057,12 +1281,17 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 	uint32_t b = (c->missing[0] | ((uint32_t)c->missing[2] << 16)) & p->candidates[1];
 	uint32_t d = (c->missing[1] | ((uint32_t)c->missing[0] << 16)) & p->candidates[2];
 	while (idle < c->repair_count && (a | b | d)) {
-		unsigned helper = a ? p->helper[0][__builtin_ctz(a)] :
-			b ? p->helper[1][__builtin_ctz(b)] : p->helper[2][__builtin_ctz(d)];
+		unsigned helper = a ? p->helper[0][__builtin_ctz(a)]
+						: b ? p->helper[1][__builtin_ctz(b)]
+							: p->helper[2][__builtin_ctz(d)];
 		unsigned capacity = RELAY_MAX_CHILDREN;
 		uint16_t children = rc_take_records(&a, p->children[0][helper], &capacity);
-		if (capacity) children |= rc_take_records(&b, p->children[1][helper], &capacity);
-		if (capacity) children |= rc_take_records(&d, p->children[2][helper], &capacity);
+		if (capacity) {
+			children |= rc_take_records(&b, p->children[1][helper], &capacity);
+		}
+		if (capacity) {
+			children |= rc_take_records(&d, p->children[2][helper], &capacity);
+		}
 		wire[RELAY_CONTROL_OFF_OWNERS + idle] = helper;
 		relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, children);
 		idle++;
@@ -1076,7 +1305,9 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 	}
 	c->survey = p->survey;
 	uint16_t failed = c->missing[0] & p->fresh_survey;
-	for (unsigned age = 1; age < RELAY_V3_CACHE_FRAMES; age++) failed |= c->missing[age];
+	for (unsigned age = 1; age < RELAY_V3_CACHE_FRAMES; age++) {
+		failed |= c->missing[age];
+	}
 	failed &= c->members;
 	unsigned surveys = c->survey != 0;
 	failed &= ~c->survey;
@@ -1108,6 +1339,229 @@ __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct r
 	}
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+/* Match the measured frozen encoder's optimization on both runtime paths. */
+__attribute__((optimize("O3")))
+#endif
+static __ramfunc void rc_finish_narrow(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
+{
+	unsigned limit = c->repair_count;
+	bool emergency = false;
+	uint32_t a, b, d;
+
+	emergency = c->repair_count > 0 && (c->missing[2] & p->emergency_child) != 0;
+	if (emergency) {
+		limit--;
+		wire[RELAY_CONTROL_OFF_OWNERS + limit] = p->emergency_helper;
+		relay_put_be16(
+			wire + RELAY_CONTROL_OFF_CHILDREN + 2U * limit,
+			p->emergency_coverage & (c->missing[0] | c->missing[1] | c->missing[2])
+		);
+	}
+
+	unsigned idle = 0;
+	if (p->urgent && c->repair_count >= 2U) {
+		rc_apply_maintenance(c, p);
+
+		wire[RELAY_CONTROL_OFF_OWNERS] = wire[RELAY_CONTROL_OFF_OWNER_SECOND] = RELAY_OWNER_MAINTENANCE;
+		/* A two-slot maintenance reservation can replace the emergency
+		 * repair in R1. Its old child mask must not remain on the wire. */
+		if (c->repair_count == 2U) {
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U, 0);
+		}
+
+		idle = 2;
+	}
+
+	/* Full pool: primary oldest first, then backup oldest first.
+	 * Narrow pool: both lanes of an older deadline precede younger work.
+	 * Fill one helper's next three records ahead of the scan. Removing those
+	 * records leaves exactly the next slot-opening record of the single-pass
+	 * algorithm, including a fourth record for the same helper. */
+
+	a = (c->missing[2] | ((uint32_t)c->missing[2] << 16)) & p->candidates[0];
+	b = (c->missing[1] | ((uint32_t)c->missing[1] << 16)) & p->candidates[1];
+	d = (c->missing[0] | ((uint32_t)c->missing[0] << 16)) & p->candidates[2];
+
+	while (idle < RC_GRANT_LIMIT && (a | b | d)) {
+		unsigned helper = a ? p->helper[0][__builtin_ctz(a)]
+						: b ? p->helper[1][__builtin_ctz(b)]
+							: p->helper[2][__builtin_ctz(d)];
+		unsigned capacity = RELAY_MAX_CHILDREN;
+		uint16_t children = rc_take_records(&a, p->children[0][helper], &capacity);
+		if (capacity) {
+			children |= rc_take_records(&b, p->children[1][helper], &capacity);
+		}
+		if (capacity) {
+			children |= rc_take_records(&d, p->children[2][helper], &capacity);
+		}
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = helper;
+		relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, children);
+		idle++;
+	}
+
+	unsigned repair_end = idle;
+	if (p->maintenance >= 0 && idle == 0 && c->repair_count >= 2U) {
+		rc_apply_maintenance(c, p);
+
+		wire[RELAY_CONTROL_OFF_OWNERS] = wire[RELAY_CONTROL_OFF_OWNER_SECOND] = RELAY_OWNER_MAINTENANCE;
+		/* A two-slot maintenance reservation can replace the emergency
+		 * repair in R1. Its old child mask must not remain on the wire. */
+		if (c->repair_count == 2U) {
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U, 0);
+		}
+
+		idle = 2;
+	}
+	c->survey = p->survey;
+	uint16_t failed = c->missing[0] & p->fresh_survey;
+	for (unsigned age = 1; age < RELAY_V3_CACHE_FRAMES; age++) {
+		failed |= c->missing[age];
+	}
+	failed &= c->members;
+	unsigned surveys = c->survey != 0;
+	failed &= ~c->survey;
+	while (failed && surveys < 2) {
+		unsigned child = __builtin_ctz((unsigned)failed);
+		failed &= failed - 1U;
+		surveys++;
+		c->survey |= RC_BIT(child);
+	}
+	if (p->reporter >= 0 && idle < RC_GRANT_LIMIT) {
+		wire[RELAY_CONTROL_OFF_OWNERS + idle++] = p->reporter;
+	}
+	/* Prefer a surveyed alternate over a same-helper retry in otherwise idle
+	 * capacity. Helpers retain refused records but suppress successful ones.
+	 * All distinct repairs, maintenance and reports keep their priority. */
+	unsigned retry = p->urgent ? 2U : 0U;
+	if (idle < RC_GRANT_LIMIT && (c->missing[p->rescue_age] & p->rescue_child)) {
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = p->rescue_helper;
+		relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, p->rescue_child);
+		/* A second distinct survey copy uses only another otherwise idle slot. */
+		if (++idle < RC_GRANT_LIMIT && p->rescue_second < RC_MAX) {
+			wire[RELAY_CONTROL_OFF_OWNERS + idle] = p->rescue_second;
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * idle, p->rescue_child);
+		}
+	} else if (idle < RC_GRANT_LIMIT && retry < repair_end) {
+		wire[RELAY_CONTROL_OFF_OWNERS + idle] = wire[RELAY_CONTROL_OFF_OWNERS + retry];
+		wire[RELAY_CONTROL_OFF_CHILDREN + 2U * idle] = wire[RELAY_CONTROL_OFF_CHILDREN + 2U * retry];
+		wire[RELAY_CONTROL_OFF_CHILDREN_LOW + 2U * idle] = wire[RELAY_CONTROL_OFF_CHILDREN_LOW + 2U * retry];
+	}
+
+	/* A retained copy must not repeatedly race R0. Keep all grant masks and
+	 * maintenance reservations; only rotate physical repair opportunities. */
+	if (!emergency && c->repair_count == 3 && !(c->flags & RELAY_CONTROL_MAINTENANCE)) {
+		uint8_t owners[3];
+		uint16_t children[3];
+		for (unsigned i = 0; i < 3; i++) {
+			owners[i] = wire[RELAY_CONTROL_OFF_OWNERS + i];
+			children[i] = relay_get_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * i);
+		}
+		unsigned first = c->frame % 3U;
+		for (unsigned i = 0; i < 3; i++) {
+			unsigned from = (i + first) % 3U;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = owners[from];
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2U * i, children[from]);
+		}
+	}
+}
+
+/* Five-age path. Planning stores oldest-first lanes; freeze only removes receipts. */
+static void rc_finish_demand(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
+{
+	uint32_t pending[5];
+	for (unsigned i = 0; i < 5; i++) {
+		pending[i] = (relay_control_missing(c, 4 - i) | ((uint32_t)relay_control_missing(c, 4 - i) << 16))
+				   & p->demand_candidates[i];
+	}
+	unsigned slot = 0;
+	if (p->urgent && c->repair_count >= 2) {
+		rc_apply_maintenance(c, p);
+		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
+		slot = 2;
+	}
+	for (unsigned lane = 0; lane < 5 && slot < c->repair_count; lane++) {
+		while (pending[lane] && slot < c->repair_count) {
+			unsigned h = p->demand_helper[lane][__builtin_ctz(pending[lane])], capacity = RELAY_MAX_CHILDREN;
+			uint16_t children = 0;
+			for (unsigned k = lane; k < 5 && capacity; k++) {
+				children |= rc_take_records(&pending[k], p->demand_children[k][h], &capacity);
+			}
+			wire[46 + slot] = h;
+			relay_put_be16(wire + 51 + 2 * slot, children);
+			slot++;
+		}
+	}
+	if (p->maintenance >= 0 && slot == 0 && c->repair_count >= 2) {
+		rc_apply_maintenance(c, p);
+		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
+		slot = 2;
+	}
+	if (slot < c->repair_count && (relay_control_missing(c, p->rescue_age) & p->rescue_child)) {
+		wire[46 + slot] = p->rescue_helper;
+		relay_put_be16(wire + 51 + 2 * slot, p->rescue_child);
+		slot++;
+	}
+	if (slot < c->repair_count && p->reporter >= 0) {
+		wire[46 + slot] = p->reporter;
+	}
+	c->survey = p->survey;
+}
+
+__ramfunc void relay_coord_finish_static_frozen(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
+{
+
+	if (rc_narrow_pool(c)) {
+		if (!c->repair_count) {
+			return;
+		}
+		rc_finish_narrow(c, p, wire);
+	} else {
+		rc_finish_full(c, p, wire);
+	}
+}
+
+__ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
+{
+	if (c->on_demand) {
+		uint16_t missing = c->missing[0] | c->missing[1] | c->missing[2] | c->missing_extra[0] | c->missing_extra[1];
+		uint16_t fresh = c->missing[0] & p->demand_eligible[0];
+		unsigned available = 0;
+		for (unsigned i = 0; i < c->repair_count; i++) {
+			uint16_t children = c->grants[i].children & missing;
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, children);
+			fresh &= ~children;
+			if (!children) {
+				available |= 1U << i;
+			}
+		}
+		/* Direct receipts after the early snapshot can empty planned grants.
+		 * Fill those slots from qualified current-frame holders at freeze, so an
+		 * open pool can serve a late direct miss at age zero. */
+		if (c->flags & RELAY_CONTROL_MAINTENANCE) {
+			available &= ~3U;
+		}
+		while (fresh && available) {
+			unsigned i = __builtin_ctz(available);
+			available &= available - 1U;
+			unsigned h = p->fresh_helper[__builtin_ctz((unsigned)fresh)];
+			uint16_t children = fresh & p->fresh_coverage[h], rest = children;
+			rest &= rest - 1U;
+			rest &= rest - 1U;
+			rest &= rest - 1U;
+			children ^= rest;
+			fresh &= ~children;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = h;
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, children);
+		}
+
+		return;
+	}
+	relay_coord_finish_static_frozen(c, p, wire);
+}
+
+#undef RC_GRANT_LIMIT
+
 void relay_coord_read_grants(struct relay_control *c, const uint8_t *wire)
 {
 	for (unsigned i = 0; i < c->repair_count; i++) {
@@ -1133,23 +1587,38 @@ void relay_coord_commit_grants(struct relay_coord *rc, const struct relay_contro
 			break;
 		}
 	}
-	/* With a three-frame cache there is at most one earlier rescue round for this
-	 * capture frame. Remember only a grant that survived the frozen allocation. */
-	if (p->rescue_child) {
+	/* Grants authorize a child, not a frame. Every still-missing record in
+	 * that child's cache had this opportunity, including younger records than
+	 * the planner's oldest choice. Record only actual frozen reservations,
+	 * independently per child, so persistent drops rotate across helpers. */
+	for (unsigned age = 0; age < relay_control_cache_frames(c); age++) {
+		uint32_t frame = c->frame - age;
+		struct rc_watch *w = &rc->watch[frame % (rc->cache_frames ? rc->cache_frames : 3U)];
+		if (w->frame != frame || w->session != c->session || w->epoch != c->epoch || w->members != c->members) {
+			continue;
+		}
 		for (unsigned slot = 0; slot < c->repair_count; slot++) {
 			const struct relay_grant *g = &c->grants[slot];
-			if ((g->owner != p->rescue_helper && g->owner != p->rescue_second) ||
-			    !(g->children & p->rescue_child)) continue;
-			uint32_t frame = c->frame - p->rescue_age;
-			struct rc_watch *w = &rc->watch[frame % RELAY_V3_CACHE_FRAMES];
-			if (w->frame == frame) {
-				if (w->rescue_child != p->rescue_child) w->rescue_helpers = 0;
-				w->rescue_child = p->rescue_child;
-				w->rescue_helpers |= RC_BIT(g->owner);
+			if (g->owner >= RC_MAX) {
+				continue;
+			}
+			uint16_t children = g->children & relay_control_missing(c, age);
+			while (children) {
+				unsigned child = __builtin_ctz((unsigned)children);
+				children &= children - 1U;
+				if (rc_narrow_pool(c)) {
+					if (!slot && !(w->rescue_tried[child] & RC_BIT(g->owner))) {
+						w->r0_only[child] |= RC_BIT(g->owner);
+					}
+					if (slot) {
+						w->r0_only[child] &= ~RC_BIT(g->owner);
+					}
+				}
+				w->rescue_tried[child] |= RC_BIT(g->owner);
 			}
 		}
 	}
-	struct rc_watch *next = &rc->watch[(c->frame + 1U) % RELAY_V3_CACHE_FRAMES];
+	struct rc_watch *next = &rc->watch[(c->frame + 1U) % (rc->cache_frames ? rc->cache_frames : 3U)];
 	*next = (struct rc_watch){.frame = c->frame + 1U,
 		.session = c->session, .epoch = c->epoch, .members = c->members, .survey = c->survey,
 		.primary_valid = c->primary_valid, .backup_valid = c->backup_valid};

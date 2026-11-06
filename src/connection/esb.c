@@ -22,6 +22,7 @@
 	THE SOFTWARE.
 */
 #include "esb.h"
+#include "relay_demand.h"
 
 #include <errno.h>
 #include <zephyr/random/random.h>
@@ -327,6 +328,8 @@ static void tdma_shadow_observe(uint8_t tracker_id, enum tdma_shadow_evidence ev
 	}
 }
 
+static uint32_t tdma_admissible_mask(uint32_t desired);
+
 /* Caller holds irq_lock, including when a stored slot is reset. */
 static void tdma_shadow_forget_tracker(uint8_t tracker_id)
 {
@@ -342,8 +345,8 @@ static void tdma_shadow_forget_tracker(uint8_t tracker_id)
 	atomic_and(&tdma_shadow_desired_mask, (atomic_val_t)~bit);
 	atomic_and(&tdma_shadow_pending_join_mask, (atomic_val_t)~bit);
 	atomic_and(&tdma_shadow_pending_leave_mask, (atomic_val_t)~bit);
-	if ((uint32_t)atomic_get(&tdma_shadow_desired_mask) == tdma_active_mask
-	    && !atomic_get(&tdma_shadow_pending_join_mask)) {
+	if (tdma_admissible_mask((uint32_t)atomic_get(&tdma_shadow_desired_mask)) == tdma_active_mask
+		&& !atomic_get(&tdma_shadow_pending_join_mask)) {
 		tdma_membership_deadline_armed = false;
 	}
 }
@@ -394,7 +397,9 @@ static uint32_t tdma_shadow_merge_locked(uint32_t now_ms)
 	atomic_set(&tdma_shadow_desired_mask, (atomic_val_t)desired_mask);
 	atomic_set(&tdma_shadow_pending_join_mask, 0);
 	atomic_set(&tdma_shadow_pending_leave_mask, (atomic_val_t)pending_leave_mask);
-	if (desired_mask == tdma_active_mask) {
+	/* Members beyond max_trackers stay desired but can never be admitted;
+	 * comparing the raw mask would re-arm an already expired deadline. */
+	if (tdma_admissible_mask(desired_mask) == tdma_active_mask) {
 		tdma_membership_deadline_armed = false;
 	} else if (!tdma_membership_deadline_armed) {
 		/* A departure has no admission cohort to collect. */
@@ -414,22 +419,6 @@ static void tdma_shadow_update(uint32_t now_ms)
 			(unsigned int)evicted_mask, now_ms, TDMA_SHADOW_LEAVE_GRACE_MS);
 	}
 }
-
-static uint32_t tdma_membership_wait_ms(uint32_t maximum_ms)
-{
-	unsigned int key = irq_lock();
-	if (tdma_membership_deadline_armed) {
-		int64_t now = k_uptime_get();
-		int32_t cohort_remaining = (int32_t)(tdma_membership_deadline_ms - (uint32_t)now);
-		int64_t gap_remaining = tdma_last_reconfig_valid
-			? TDMA_RECONFIG_MIN_MS - (now - tdma_last_reconfig_time) : 0;
-		int64_t remaining = MAX((int64_t)cohort_remaining, gap_remaining);
-		maximum_ms = remaining > 0 ? MIN(maximum_ms, (uint32_t)remaining) : 0;
-	}
-	irq_unlock(key);
-	return maximum_ms;
-}
-
 
 #define TEST_ALL_RATE_QUANTUM_TPS 10U
 #define TEST_ALL_JOIN_CONFIG_GRACE_MS 1500
@@ -627,7 +616,86 @@ static uint8_t tdma_slot_ticks_for(uint8_t active_count)
  * or, for an all-relay-capable fleet, staged until activation_ticks (receiver
  * ticks, the PONG timestamp clock) so every tracker switches together. See
  * "Staged layout activation" in relay_protocol.h. */
+static struct relay_runtime_settings relay_settings = {
+	CONFIG_RELAY_MAX_TRACKERS,
+	CONFIG_RELAY_MAX_REPAIRS,
+	CONFIG_RELAY_SLOT_TICKS,
+	CONFIG_RELAY_TPS_MIN,
+	CONFIG_RELAY_TPS_MAX,
+	CONFIG_RELAY_REPAIR_FLOOR,
+};
+static struct relay_runtime_settings relay_applied_settings;
+static uint32_t relay_settings_generation = 1, relay_applied_generation;
+static struct relay_geometry relay_receiver_geometry = {16, 1, 16, 120, 288, 1};
+const struct relay_geometry *relay_geometry_active = &relay_receiver_geometry;
+struct relay_timeline relay_timeline_active;
+
+static struct relay_demand relay_demand_state;
+static uint8_t relay_frame_repairs(uint32_t frame)
+{
+	if (relay_applied_settings.repair_floor == relay_applied_settings.max_repairs) {
+		return relay_demand_slots(frame, relay_applied_settings.max_repairs);
+	}
+	uint32_t offset = frame - relay_demand_state.frame;
+	return offset < 3U ? relay_demand_state.queued[offset] : relay_demand_slots(frame, relay_demand_state.target);
+}
+
+static void relay_frame_announce(uint32_t frame, uint32_t start)
+{
+	if (relay_applied_settings.repair_floor < relay_applied_settings.max_repairs) {
+		relay_demand_advance(&relay_demand_state, frame, &relay_applied_settings);
+	}
+	struct relay_runtime_anchor a;
+	relay_runtime_anchor_set(
+		&a,
+		frame,
+		start + RELAY_V3_B_PREAMBLE,
+		RELAY_V3_DIRECT_SLOTS,
+		relay_frame_repairs(frame),
+		relay_frame_repairs(frame + 1U),
+		relay_frame_repairs(frame + 2U),
+		RELAY_V3_SLOT_TICKS,
+		relay_geometry_current()->tps
+	);
+	relay_timeline_announce(&relay_timeline_active, &a);
+}
+
+static void relay_settings_load(void)
+{
+	uint8_t record[10];
+	struct relay_runtime_settings value = relay_settings;
+	int length = sys_read_checked(RELAY_LAYOUT_SETTINGS, record, sizeof(record));
+	if (length == 9 && record[0] == 1U && record[8] == relay_crc8(7, record, 8)) {
+		value = (struct relay_runtime_settings){
+			record[1],
+			record[2],
+			record[3],
+			relay_get_be16(record + 4),
+			relay_get_be16(record + 6),
+			record[2]
+		};
+	}
+	if (length == sizeof(record) && record[0] == 2U && record[9] == relay_crc8(7, record, 9)) {
+		value = (struct relay_runtime_settings){
+			record[1],
+			record[2],
+			record[3],
+			relay_get_be16(record + 4),
+			relay_get_be16(record + 6),
+			record[8]
+		};
+	}
+	if (!relay_runtime_validate(&value, IS_ENABLED(CONFIG_RELAY_EXPERIMENTAL_SLOT_15))) {
+		value = (struct relay_runtime_settings){11, 5, 16, 100, 120, 5};
+		LOG_WRN("Invalid relay settings; using static 11/5/16/100/120 defaults");
+	}
+	relay_settings = value;
+}
+
 struct tdma_publication {
+	struct relay_runtime_settings settings;
+	struct relay_geometry geometry;
+	uint32_t settings_generation;
 	uint32_t old_mask;
 	uint32_t new_mask;
 	uint16_t forward_mask;
@@ -644,7 +712,6 @@ struct tdma_publication {
 };
 static uint8_t relay_profile;
 static uint32_t relay_origin;
-static uint64_t relay_origin64;
 /* Frame anchor survives profile-1 layout changes that clear current grants. */
 static uint32_t relay_frame_anchor, relay_start_anchor;
 /* Epoch of the active layout; tdma_config_epoch already names a staged one. */
@@ -657,6 +724,7 @@ static uint32_t relay_learn_lock_max;
 static uint32_t irq_probe_plan_max, irq_probe_plan_count;
 static uint32_t irq_probe_tick_max, irq_probe_tick_count;
 #define IRQ_PROBE_BEGIN(name) uint32_t irq_probe_start_##name = DWT->CYCCNT
+#define IRQ_PROBE_RESTART(name) irq_probe_start_##name = DWT->CYCCNT
 #define IRQ_PROBE_END(name) do { \
     uint32_t elapsed = DWT->CYCCNT - irq_probe_start_##name; \
     irq_probe_##name##_max = MAX(irq_probe_##name##_max, elapsed); \
@@ -664,6 +732,7 @@ static uint32_t irq_probe_tick_max, irq_probe_tick_count;
 } while (0)
 #else
 #define IRQ_PROBE_BEGIN(name)
+#define IRQ_PROBE_RESTART(name)
 #define IRQ_PROBE_END(name)
 #endif
 
@@ -692,6 +761,45 @@ static struct {
 static bool tdma_staged_due_locked(uint32_t now_ticks)
 {
 	return tdma_staged.valid && (int32_t)(now_ticks - tdma_staged.activation_ticks) >= 0;
+}
+
+/* Members the next layout can admit: stored slots, then in v3 only the
+ * first max_trackers of those. */
+static uint32_t tdma_admissible_mask(uint32_t desired)
+{
+	uint32_t stored_mask
+		= stored_trackers >= MAX_TRACKERS ? UINT32_MAX : (stored_trackers > 0 ? BIT(stored_trackers) - 1U : 0U);
+	uint32_t candidates = desired & stored_mask;
+	if (!relay_coord.v3_requested) {
+		return candidates;
+	}
+	uint32_t selected = 0;
+	for (unsigned n = 0; n < relay_settings.max_trackers && candidates; n++) {
+		uint32_t bit = candidates & (0U - candidates);
+		selected |= bit;
+		candidates &= candidates - 1U;
+	}
+	return selected;
+}
+
+/* How long the stats owner may sleep while a membership change is pending.
+ * A staged layout cannot be applied before its activation tick, so an
+ * expired cohort deadline must not turn that wait into a busy loop. */
+static uint32_t tdma_membership_wait_ms(uint32_t maximum_ms)
+{
+	unsigned int key = irq_lock();
+	if (tdma_staged.valid) {
+		int32_t staged_ticks = (int32_t)(tdma_staged.activation_ticks - (uint32_t)k_uptime_ticks());
+		maximum_ms = staged_ticks > 0 ? MIN(maximum_ms, k_ticks_to_ms_ceil32((uint32_t)staged_ticks)) : 0;
+	} else if (tdma_membership_deadline_armed) {
+		int64_t now = k_uptime_get();
+		int32_t cohort_remaining = (int32_t)(tdma_membership_deadline_ms - (uint32_t)now);
+		int64_t gap_remaining = tdma_last_reconfig_valid ? TDMA_RECONFIG_MIN_MS - (now - tdma_last_reconfig_time) : 0;
+		int64_t remaining = MAX((int64_t)cohort_remaining, gap_remaining);
+		maximum_ms = remaining > 0 ? MIN(maximum_ms, (uint32_t)remaining) : 0;
+	}
+	irq_unlock(key);
+	return maximum_ms;
 }
 
 /* Layout tuple a PONG to `id` carries (ISR or irq_lock): a staged layout
@@ -741,13 +849,19 @@ static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
 	}
 	relay_forward_published = p->forward_mask;
 	relay_coord_set_forward_layout(&relay_coord, p->forward_mask);
-	if (p->profile && !relay_profile) {
+	relay_applied_settings = p->settings;
+	relay_coord.cache_frames = p->settings.repair_floor < p->settings.max_repairs ? 5 : 3;
+	if (p->profile) {
+		uint32_t seed = relay_profile ? relay_timeline_active.frame + 1U : 0U;
+		relay_receiver_geometry = p->geometry;
 		relay_origin = tdma_staged.activation_ticks;
-		relay_frame_anchor = 0;
+		relay_frame_anchor = seed;
 		relay_start_anchor = relay_origin;
-		uint64_t now = k_uptime_ticks();
-		relay_origin64 = now + (int32_t)(relay_origin - (uint32_t)now);
+		relay_timeline_clear(&relay_timeline_active);
+		relay_demand_reset(&relay_demand_state, seed, p->settings.repair_floor);
+		relay_frame_announce(seed, relay_origin);
 	}
+	relay_applied_generation = p->settings_generation;
 	relay_profile = p->profile;
 	relay_layout_generation++;
 	relay_epoch = p->epoch;
@@ -825,14 +939,13 @@ static void tdma_recalculate(bool forced)
 			tdma_apply_finish(&due, now, true);
 			continue;
 		}
-		if (!forced && (diagnostics_reset || atomic_get(&tdma_shadow_pending_join_mask)
-		    || ((uint32_t)atomic_get(&tdma_shadow_desired_mask) & ~tdma_active_mask))) {
+		if (!forced
+			&& (diagnostics_reset || atomic_get(&tdma_shadow_pending_join_mask)
+				|| (tdma_admissible_mask((uint32_t)atomic_get(&tdma_shadow_desired_mask)) & ~tdma_active_mask))) {
 			(void)tdma_shadow_merge_locked((uint32_t)now);
 		}
 		uint32_t old_mask = tdma_active_mask;
-		uint32_t stored_mask = stored_trackers >= MAX_TRACKERS
-			? UINT32_MAX : (stored_trackers > 0 ? BIT(stored_trackers) - 1U : 0U);
-		uint32_t new_mask = (uint32_t)atomic_get(&tdma_shadow_desired_mask) & stored_mask;
+		uint32_t new_mask = tdma_admissible_mask((uint32_t)atomic_get(&tdma_shadow_desired_mask));
 		uint8_t active_count = 0;
 		for (uint8_t i = 0; i < stored_trackers && i < MAX_TRACKERS; i++) {
 			if (new_mask & BIT(i)) {
@@ -857,7 +970,7 @@ static void tdma_recalculate(bool forced)
 		}
 		uint8_t forward_count = relay_mask_count(forward_mask);
 		bool forward_changed = forward_mask != relay_forward_published;
-		uint8_t slot_ticks = profile ? RELAY_V3_SLOT_TICKS : tdma_slot_ticks_for(active_count + forward_count);
+		uint8_t slot_ticks = profile ? relay_settings.slot_ticks : tdma_slot_ticks_for(active_count + forward_count);
 		bool test_all_layout = atomic_get(&test_all_enabled) != 0;
 		bool ladder_step = tdma_cap_level != tdma_published_cap_level;
 
@@ -868,7 +981,8 @@ static void tdma_recalculate(bool forced)
 			irq_unlock(key);
 			return;
 		}
-		if (!mask_changed && !forward_changed && profile == relay_profile && slot_ticks == tdma_dynamic_slot_ticks) {
+		if (!mask_changed && !forward_changed && profile == relay_profile && slot_ticks == tdma_dynamic_slot_ticks
+			&& relay_settings_generation == relay_applied_generation) {
 			if (!test_all_layout) {
 				tdma_published_cap_level = tdma_cap_level;
 			}
@@ -898,7 +1012,20 @@ static void tdma_recalculate(bool forced)
 		if (active_count) {
 			epoch = ++tdma_config_epoch;
 		}
+		struct relay_geometry geometry = relay_receiver_geometry;
+		if (profile) {
+			(void)relay_geometry_make(
+				&geometry,
+				active_count,
+				relay_settings.max_repairs,
+				relay_settings.slot_ticks,
+				relay_settings.tps_max
+			);
+		}
 		struct tdma_publication pub = {
+			.settings = relay_settings,
+			.settings_generation = relay_settings_generation,
+			.geometry = geometry,
 			.old_mask = old_mask,
 			.new_mask = new_mask,
 			.forward_mask = forward_mask,
@@ -919,19 +1046,15 @@ static void tdma_recalculate(bool forced)
 			tdma_staged.p = pub;
 			tdma_staged.activation_ticks = (uint32_t)k_uptime_ticks()
 				+ (uint32_t)k_ms_to_ticks_ceil32(RELAY_LAYOUT_ACTIVATION_MS);
-			/* Within a profile the frame grid and B's frame count run on;
-			 * trackers reject B whose frame goes backwards. Activate on a
-			 * 15-frame (4096-tick) boundary of the running grid. */
-			if (relay_profile && profile) {
-				tdma_staged.activation_ticks += 4096U
-					- (tdma_staged.activation_ticks - relay_origin) % 4096U;
-			}
+			/* Quiet-zone admission fences the old layout; this activation
+			 * tick is the first start of the new membership's timeline. */
 			tdma_staged.valid = true;
 			irq_unlock(key);
 			LOG_INF("TDMA layout epoch %u staged: activates in %u ms", epoch,
 				(unsigned)RELAY_LAYOUT_ACTIVATION_MS);
 			return;
 		}
+		tdma_staged.activation_ticks = (uint32_t)k_uptime_ticks();
 		tdma_apply_locked(&pub, now);
 		irq_unlock(key);
 		tdma_apply_finish(&pub, now, false);
@@ -2129,8 +2252,10 @@ static void raw_arq_reset(void)
  * bundles and PINGs), as if obstructed, while peers still hear it. */
 #ifdef CONFIG_RELAY_FRAME_LEDGER
 /* Background reservation/validated-packet counters, never in freeze encoding. */
-static uint32_t relay_pool_reserved[RELAY_V3_REPAIR_SLOTS][4]; /* repair/report/maintenance/idle */
-static uint32_t relay_pool_received[RELAY_V3_REPAIR_SLOTS];
+static uint32_t relay_r_frames[6];
+static uint32_t relay_direct_expected[16], relay_direct_missing[16];
+static uint32_t relay_pool_reserved[RELAY_V3_REPAIR_MAX][4]; /* repair/report/maintenance/idle */
+static uint32_t relay_pool_received[RELAY_V3_REPAIR_MAX];
 #endif
 static uint8_t relay_block_id = 0xFF;
 static uint8_t relay_block_percent;
@@ -2147,7 +2272,7 @@ static struct {
 	/* Cumulative repair funnel and delivery age, sampled by the relay console. */
 	struct {
 		uint32_t seen, invalid, phase, slot, record;
-		uint32_t received[RC_MAX], duplicate[RC_MAX], obsolete[RC_MAX], age[RC_MAX][RELAY_V3_CACHE_FRAMES];
+		uint32_t received[RC_MAX], duplicate[RC_MAX], obsolete[RC_MAX], age[RC_MAX][RELAY_CACHE_MAX_FRAMES];
 	} repair;
 } relay_rx_stats;
 /* Latest private diagnostic frame per tracker (RELAY_DIAG_*), console only. */
@@ -2609,8 +2734,10 @@ static void esb_ack_handler_cb(
 				uint32_t lead = tdma_staged.activation_ticks - rx_ticks;
 				trailer.pending = (int32_t)lead > 0;
 				trailer.pending_epoch = tdma_staged.p.epoch;
-				trailer.pending_total = tdma_staged.p.profile ? (0x80U | tdma_staged.p.profile)
-					: tdma_staged.p.active_count + tdma_staged.p.forward_count;
+				trailer.pending_total
+					= tdma_staged.p.profile
+						? relay_geometry_code(tdma_staged.p.active_count, tdma_staged.p.settings.max_repairs)
+						: tdma_staged.p.active_count + tdma_staged.p.forward_count;
 				trailer.pending_slot_ticks = tdma_staged.p.slot_ticks;
 				trailer.pending_member_mask = (uint16_t)tdma_staged.p.new_mask;
 				trailer.activation_units = (uint16_t)MIN(
@@ -2618,11 +2745,13 @@ static void esb_ack_handler_cb(
 			} else if (relay_profile && !tdma_staged.valid && ack_payload->data[7] == ESB_PONG_FLAG_NORMAL) {
 				/* The legacy tuple cannot say profile 1, so a tracker joining a
 				 * running profile learns it as a layout activating on the next
-				 * 15-frame boundary (exactly 4096 ticks); B then anchors it. */
-				uint32_t lead = 4096U - (rx_ticks - relay_origin) % 4096U;
+				 * actual frame boundary; B then anchors its cap and future R. */
+				uint32_t frame = relay_frame_near(relay_frame_anchor, relay_start_anchor, rx_ticks);
+				uint32_t lead = relay_frame_start(relay_origin, frame + 1U) - rx_ticks;
 				trailer.pending = true;
 				trailer.pending_epoch = epoch;
-				trailer.pending_total = 0x80U | relay_profile;
+				trailer.pending_total
+					= relay_geometry_code(relay_mask_count(members), relay_applied_settings.max_repairs);
 				trailer.pending_slot_ticks = RELAY_V3_SLOT_TICKS;
 				trailer.pending_member_mask = members;
 				trailer.activation_units = (uint16_t)((lead + RELAY_ACTIVATION_UNIT_TICKS - 1U)
@@ -3510,9 +3639,9 @@ static void esb_receive_repair(const struct esb_payload *payload, uint32_t event
 				return;
 			}
 		}
-		if (child >= stored_trackers || age >= RELAY_V3_CACHE_FRAMES ||
-		    !(relay_grants.grants[slot].children & BIT(child)) ||
-		    !(relay_grants.missing[age] & BIT(child))) {
+		if (child >= stored_trackers || age >= relay_control_cache_frames(&relay_grants)
+			|| !(relay_grants.grants[slot].children & BIT(child))
+			|| !(relay_control_missing(&relay_grants, age) & BIT(child))) {
 			relay_rx_stats.repair.record++;
 			return;
 		}
@@ -5424,6 +5553,7 @@ static void esb_thread(void)
 	clocks_start();
 	relay_session = sys_rand32_get();
 
+	relay_settings_load();
 	int roster_err = tracker_store_restore();
 	uint32_t roster_retry_at = k_uptime_get_32() + 1000;
 	uint8_t tracker_count = stored_trackers;
@@ -5556,9 +5686,10 @@ void esb_relay_block(uint8_t id, uint8_t percent)
 
 bool esb_relay_block_mask(uint16_t mask, uint8_t seconds)
 {
-	unsigned count = 0;
-	for (unsigned i = 0; i < 11; i++) count += !!(mask & BIT(i));
-	if ((mask & ~0x07ffU) || count > 3 || seconds > 60 || (mask && !seconds)) return false;
+	unsigned count = relay_mask_count(mask);
+	if (count > 3 || seconds > 60 || (mask && !seconds)) {
+		return false;
+	}
 	unsigned key = irq_lock();
 	relay_block_id = 0xff;
 	relay_block_percent = 0;
@@ -5580,11 +5711,129 @@ bool esb_relay_blocks_ota(uint8_t id)
 void esb_relay_print_pool(void)
 {
 #ifdef CONFIG_RELAY_FRAME_LEDGER
-	for (unsigned slot = 0; slot < RELAY_V3_REPAIR_SLOTS; slot++)
-		printk("  pool slot=%u repair=%u report=%u maintenance=%u idle=%u received=%u\n", slot,
-			relay_pool_reserved[slot][0], relay_pool_reserved[slot][1],
-			relay_pool_reserved[slot][2], relay_pool_reserved[slot][3], relay_pool_received[slot]);
+	for (unsigned ch = 0; ch < 16; ch++) {
+		printk(
+			"  direct_frames child=%u expected=%u missing=%u\n",
+			ch,
+			relay_direct_expected[ch],
+			relay_direct_missing[ch]
+		);
+	}
+	for (unsigned r = 0; r < 6; r++) {
+		printk("  R_frames R=%u frames=%u\n", r, relay_r_frames[r]);
+	}
+	for (unsigned slot = 0; slot < MAX(2U, RELAY_V3_REPAIR_SLOTS); slot++) {
+		printk(
+			"  pool slot=%u repair=%u report=%u maintenance=%u idle=%u received=%u\n",
+			slot,
+			relay_pool_reserved[slot][0],
+			relay_pool_reserved[slot][1],
+			relay_pool_reserved[slot][2],
+			relay_pool_reserved[slot][3],
+			relay_pool_received[slot]
+		);
+	}
 #endif
+}
+
+void esb_relay_layout_print(void)
+{
+	unsigned key = irq_lock();
+	struct relay_runtime_settings desired = relay_settings, applied = relay_applied_settings;
+	uint32_t requested = relay_settings_generation, current = relay_applied_generation;
+	uint8_t direct = RELAY_V3_DIRECT_SLOTS, profile = relay_profile;
+	struct relay_control announced = relay_grants;
+	irq_unlock(key);
+	printk(
+		"relay layout: max_trackers=%u max_repairs=%u slot_ticks=%u tps_min=%u tps_max=%u "
+		"generation=%u applied=%u repair_floor=%u\n",
+		desired.max_trackers,
+		desired.max_repairs,
+		desired.slot_ticks,
+		desired.tps_min,
+		desired.tps_max,
+		requested,
+		current,
+		desired.repair_floor
+	);
+	printk(
+		"relay layout active: profile=%u direct=%u max_repairs=%u slot_ticks=%u tps_min=%u "
+		"tps_max=%u repair_floor=%u\n",
+		profile,
+		direct,
+		applied.max_repairs,
+		applied.slot_ticks,
+		applied.tps_min,
+		applied.tps_max,
+		applied.repair_floor
+	);
+	printk(
+		"relay B plan: session=%u frame=%u direct=%u R=%u next_R=%u next2_R=%u slot_ticks=%u tps_max=%u\n",
+		announced.session,
+		announced.frame,
+		announced.direct_count,
+		announced.repair_count,
+		relay_control_next_repairs(&announced),
+		relay_control_next2_repairs(&announced),
+		announced.slot_ticks,
+		announced.tps_max
+	);
+}
+
+int esb_relay_layout_set(const char *name, uint16_t value)
+{
+	k_mutex_lock(&tracker_store_lock, K_FOREVER);
+	struct relay_runtime_settings candidate = relay_settings;
+	if (!strcmp(name, "max_trackers") && value <= 16U) {
+		candidate.max_trackers = value;
+	} else if (!strcmp(name, "max_repairs") && value <= 5U) {
+		candidate.max_repairs = value;
+		/* Equality selects static mode and follows every ceiling edit. */
+		if (relay_settings.repair_floor == relay_settings.max_repairs || candidate.repair_floor > value) {
+			candidate.repair_floor = value;
+		}
+	} else if (!strcmp(name, "repair_floor") && value <= 5U) {
+		candidate.repair_floor = value;
+	} else if (!strcmp(name, "slot_ticks") && value <= 255U) {
+		candidate.slot_ticks = value;
+	} else if (!strcmp(name, "tps_min")) {
+		candidate.tps_min = value;
+	} else if (!strcmp(name, "tps_max")) {
+		candidate.tps_max = value;
+	} else {
+		k_mutex_unlock(&tracker_store_lock);
+		return -EINVAL;
+	}
+	if (!relay_runtime_validate(&candidate, IS_ENABLED(CONFIG_RELAY_EXPERIMENTAL_SLOT_15))) {
+		k_mutex_unlock(&tracker_store_lock);
+		return -EINVAL;
+	}
+	if (candidate.max_trackers == relay_settings.max_trackers && candidate.max_repairs == relay_settings.max_repairs
+		&& candidate.slot_ticks == relay_settings.slot_ticks && candidate.tps_min == relay_settings.tps_min
+		&& candidate.tps_max == relay_settings.tps_max && candidate.repair_floor == relay_settings.repair_floor) {
+		k_mutex_unlock(&tracker_store_lock);
+		esb_relay_layout_print();
+		return 0;
+	}
+	uint8_t record[10] = {2, candidate.max_trackers, candidate.max_repairs, candidate.slot_ticks};
+	relay_put_be16(record + 4, candidate.tps_min);
+	relay_put_be16(record + 6, candidate.tps_max);
+	record[8] = candidate.repair_floor;
+	record[9] = relay_crc8(7, record, 9);
+	int result = sys_write_checked(RELAY_LAYOUT_SETTINGS, record, sizeof(record));
+	if (!result) {
+		unsigned key = irq_lock();
+		relay_settings = candidate;
+		relay_settings_generation++;
+		irq_unlock(key);
+		tdma_recalculate(true);
+	}
+	k_mutex_unlock(&tracker_store_lock);
+	if (!result) {
+		k_sem_give(&tdma_membership_wake);
+		esb_relay_layout_print();
+	}
+	return result;
 }
 
 void esb_relay_print_status(void)
@@ -5753,6 +6002,26 @@ struct relay_broadcast_work {
 	uint32_t freeze_rtc;
 };
 
+/* Keep the five-age work out of the static encoder's register lifetime. */
+__attribute__((noipa, optimize("O3"))) static __ramfunc void
+relay_freeze_demand(struct relay_coord *rc, const struct relay_broadcast_work *w)
+{
+	struct relay_control *c = w->control;
+
+	for (unsigned age = 3; age < 5; age++) {
+		const struct rc_receipt *r = &rc->receipt[w->plan->receipt_index[age]];
+		relay_control_missing(c, age) = c->expected & ~(r->frame == c->frame - age ? r->received : 0);
+	}
+	uint16_t debt = 0;
+	for (unsigned age = 0; age < 5; age++) {
+		debt |= relay_control_missing(c, age) & w->plan->demand_eligible[age];
+	}
+	relay_demand_update(&relay_demand_state, c->frame, relay_mask_count(debt), &relay_applied_settings);
+	relay_control_set_next2_repairs(c, relay_frame_repairs(c->frame + 2U));
+	relay_coord_finish_frozen(c, w->plan, w->wire);
+	relay_control_finish_encode(w->wire, c, w->crc, false);
+}
+
 /* Attribute provenance: Round 11 linked model and DWT arm evidence retain the freeze boundary. Whole-thread O3 has only group-level evidence; keep pending isolated A/B. */
 __attribute__((noipa, optimize("O3")))
 static __ramfunc int relay_freeze_arm(struct relay_coord *rc, const struct relay_broadcast_work *w)
@@ -5767,7 +6036,7 @@ static __ramfunc int relay_freeze_arm(struct relay_coord *rc, const struct relay
 	if (err) goto failed;
 	for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
 		const struct rc_receipt *r = &rc->receipt[w->plan->receipt_index[age]];
-		c->missing[age] = c->expected & ~(r->frame == c->frame - age ? r->received : 0);
+		relay_control_missing(c, age) = c->expected & ~(r->frame == c->frame - age ? r->received : 0);
 	}
 	/* Arm the immutable radio schedule before encoding the frozen masks.
 	 * TIMER delays TXEN by 21 us after the launch edge, then RADIO ramps
@@ -5780,8 +6049,12 @@ static __ramfunc int relay_freeze_arm(struct relay_coord *rc, const struct relay
 #ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
 	relay_b_arm_cycles_max = MAX(relay_b_arm_cycles_max, armed - cycles);
 #endif
-	relay_coord_finish_frozen(c, w->plan, w->wire);
-	relay_control_finish_encode(w->wire, c, w->crc, false);
+	if (c->on_demand) {
+		relay_freeze_demand(rc, w);
+	} else {
+		relay_coord_finish_static_frozen(c, w->plan, w->wire);
+		relay_control_finish_static_encode(w->wire, c, w->crc, false);
+	}
 	__DMB();
 #ifdef CONFIG_RELAY_CYCLE_DIAGNOSTICS
 	relay_b_encode_cycles_max = MAX(relay_b_encode_cycles_max, DWT->CYCCNT - armed);
@@ -5819,11 +6092,64 @@ static void relay_freeze_callback(int32_t channel, uint64_t expires, void *conte
 	if (!err) {
 		relay_coord_read_grants(w->control, w->wire);
 		relay_grants = *w->control;
+		if (w->control->on_demand) {
+			relay_frame_announce(w->control->frame, w->control->preamble_ticks - RELAY_V3_B_PREAMBLE);
+		}
 		relay_coord_commit_grants(&relay_coord, w->control, w->plan);
 	}
 	w->result = err;
 	irq_unlock(key);
 	k_sem_give(&relay_freeze_done);
+}
+
+/* Copy each mutable row/history atomically, then plan with IRQs enabled.
+ * Freeze rechecks current receipts; publication rejects a changed network. */
+static bool relay_broadcast_context_current(const struct relay_control *control, uint32_t origin);
+static void relay_broadcast_plan(struct relay_control *control, struct rc_grant_plan *plan, struct esb_payload *payload)
+{
+	static struct relay_coord snapshot;
+	for (unsigned i = 0; i < RC_MAX; i++) {
+		unsigned key = irq_lock();
+		IRQ_PROBE_BEGIN(plan);
+		snapshot.t[i] = relay_coord.t[i];
+		memcpy(snapshot.peer[i], relay_coord.peer[i], sizeof(snapshot.peer[i]));
+		memcpy(snapshot.choice[i], relay_coord.choice[i], sizeof(snapshot.choice[i]));
+		snapshot.maintenance_ms[i] = relay_coord.maintenance_ms[i];
+		snapshot.report_ms[i] = relay_coord.report_ms[i];
+		IRQ_PROBE_END(plan);
+		irq_unlock(key);
+	}
+	for (unsigned i = 0; i < RELAY_CACHE_MAX_FRAMES; i++) {
+		unsigned key = irq_lock();
+		IRQ_PROBE_BEGIN(plan);
+		snapshot.watch[i] = relay_coord.watch[i];
+		snapshot.receipt[i] = relay_coord.receipt[i];
+		IRQ_PROBE_END(plan);
+		irq_unlock(key);
+	}
+	unsigned key = irq_lock();
+	IRQ_PROBE_BEGIN(plan);
+	snapshot.learn_members = relay_coord.learn_members;
+	snapshot.maintenance_next = relay_coord.maintenance_next;
+	snapshot.report_next = relay_coord.report_next;
+	snapshot.survey_next = relay_coord.survey_next;
+	IRQ_PROBE_END(plan);
+	irq_unlock(key);
+	snapshot.cache_frames = relay_coord.cache_frames;
+	relay_coord_plan_watch(&snapshot, control);
+	relay_coord_plan_grants(&snapshot, control, plan, k_uptime_get_32());
+	if (relay_applied_settings.repair_floor < 2U && control->frame % 8U == 0 && control->repair_count >= 2U
+		&& plan->maintenance >= 0) {
+		plan->urgent = true;
+	}
+	relay_control_encode(payload->data, control);
+}
+
+static bool relay_broadcast_context_current(const struct relay_control *control, uint32_t origin)
+{
+	return esb_initialized && relay_profile && !esb_pairing
+		&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask) && control->session == relay_session
+		&& control->epoch == relay_epoch && control->members == (uint16_t)tdma_active_mask && origin == relay_origin;
 }
 
 /* B is prepared outside the radio ISR. ESB owns the bounded PRX/TX/PRX turn. */
@@ -5858,7 +6184,13 @@ static void relay_broadcast_thread(void)
 			&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask);
 		uint32_t origin = relay_origin;
 		uint32_t now = (uint32_t)k_uptime_ticks();
-		uint32_t frame = relay_frame_at_tick64(relay_origin64, k_uptime_ticks());
+		uint32_t frame = relay_timeline_active.frame, start;
+		unsigned advances = 0;
+		while (active && relay_timeline_start(&relay_timeline_active, frame + 1U, &start) && (int32_t)(now - start) >= 0
+			   && advances++ < 8U) {
+			frame++;
+			relay_frame_announce(frame, start);
+		}
 		uint32_t preamble = relay_frame_start(origin, frame) + RELAY_V3_B_PREAMBLE;
 		relay_frame_anchor = frame;
 		relay_start_anchor = preamble - RELAY_V3_B_PREAMBLE;
@@ -5871,25 +6203,52 @@ static void relay_broadcast_thread(void)
 		/* Plan the watch map early in the frame; only the masks wait for
 		 * the freeze. With 11 members planning takes up to ~0.4 ms. */
 		int32_t lead = preamble - now;
-		if (lead < 8 || lead > 120) {
+		uint32_t plan_lead = relay_plan_lead((uint16_t)tdma_active_mask);
+#if defined(CONFIG_RELAY_FORCE_FULL_FLEET_PLAN)
+		plan_lead = relay_plan_lead(UINT16_MAX);
+#endif
+		if (lead < 8 || lead > (int32_t)plan_lead) {
 			IRQ_PROBE_END(plan);
 			irq_unlock(key);
-			k_usleep(lead > 120 ? k_ticks_to_us_floor32(lead - 120) : 100);
+			k_usleep(lead > (int32_t)plan_lead ? k_ticks_to_us_floor32(lead - plan_lead) : 100);
 			continue;
 		}
 		struct relay_control control = {
-			.epoch = relay_epoch, .repair_count = RELAY_V3_REPAIR_SLOTS,
-			.session = relay_session, .frame = frame, .preamble_ticks = preamble,
-			.members = (uint16_t)tdma_active_mask, .expected = (uint16_t)tdma_active_mask,
+			.direct_count = RELAY_V3_DIRECT_SLOTS,
+			.slot_ticks = RELAY_V3_SLOT_TICKS,
+			.tps_max = relay_geometry_current()->tps,
+			.epoch = relay_epoch,
+			.repair_count = relay_frame_repairs(frame),
+			.on_demand = relay_applied_settings.repair_floor < relay_applied_settings.max_repairs,
+			.session = relay_session,
+			.frame = frame,
+			.preamble_ticks = preamble,
+			.members = (uint16_t)tdma_active_mask,
+			.expected = (uint16_t)tdma_active_mask,
 			.profile = RELAY_PROFILE_120HZ,
 		};
+		relay_control_set_next_repairs(&control, relay_frame_repairs(frame + 1U));
+		relay_control_set_next2_repairs(&control, relay_frame_repairs(frame + 2U));
 		uint32_t t_plan = (uint32_t)k_uptime_ticks();
-		struct rc_grant_plan plan;
-		relay_coord_plan_watch(&relay_coord, &control);
-		relay_coord_plan_grants(&relay_coord, &control, &plan, k_uptime_get_32());
+		/* Sole broadcast-thread ownership; the callback finishes before reuse.
+		 * Keep the five-age snapshot off the unchanged 1536-byte stack. */
+		static struct rc_grant_plan plan;
+		IRQ_PROBE_END(plan);
+		irq_unlock(key);
 		struct esb_payload payload = {.pipe = 1, .noack = true, .length = RELAY_CONTROL_LEN};
-		relay_control_encode(payload.data, &control);
+		relay_broadcast_plan(&control, &plan, &payload);
 		struct relay_control_crc_plan crc_plan = relay_control_plan_crc(payload.data);
+		key = irq_lock();
+		IRQ_PROBE_RESTART(plan);
+		if (!relay_broadcast_context_current(&control, origin)) {
+			IRQ_PROBE_END(plan);
+			irq_unlock(key);
+			continue;
+		}
+
+		/* Helper selection runs on live state between broadcasts. Publish only
+		 * this membership input; never overwrite concurrently learned rows. */
+		relay_coord.learn_members = control.members;
 		uint8_t *wire = esb_prx_broadcast_prepare(&payload);
 		struct relay_broadcast_work work = {
 			.control = &control, .plan = &plan, .wire = wire,
@@ -5925,6 +6284,13 @@ static void relay_broadcast_thread(void)
 		}
 #ifdef CONFIG_RELAY_FRAME_LEDGER
 		if (!err) {
+			relay_r_frames[control.repair_count]++;
+			for (unsigned ch = 0; ch < 16; ch++) {
+				if (control.expected & BIT(ch)) {
+					relay_direct_expected[ch]++;
+					relay_direct_missing[ch] += !!(control.missing[0] & BIT(ch));
+				}
+			}
 			for (unsigned slot = 0; slot < control.repair_count; slot++) {
 				const struct relay_grant *g = &control.grants[slot];
 				unsigned kind = g->owner == RELAY_OWNER_MAINTENANCE ? 2 :
@@ -5935,6 +6301,16 @@ static void relay_broadcast_thread(void)
 #endif
 
 #ifdef CONFIG_RELAY_FRAME_LEDGER
+		ledger_note(
+			relay_session,
+			control.frame,
+			3,
+			40,
+			control.repair_count,
+			relay_control_next_repairs(&control),
+			relay_control_next2_repairs(&control)
+		);
+		ledger_note(relay_session, control.frame, 3, 42, relay_demand_state.quiet, relay_demand_state.target, 0);
 		for (unsigned child = 0; child < RELAY_MAX_TRACKERS; child++) {
 			if (!ledger_child_enabled(child)) continue;
 			uint16_t helpers = 0;
@@ -5943,8 +6319,10 @@ static void relay_broadcast_thread(void)
 				if (g->owner < RELAY_MAX_TRACKERS && (g->children & BIT(child)))
 					helpers |= BIT(g->owner);
 			}
-			for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
-				if (!(control.missing[age] & BIT(child))) continue;
+			for (unsigned age = 0; age < relay_control_cache_frames(&control); age++) {
+				if (!(relay_control_missing(&control, age) & BIT(child))) {
+					continue;
+				}
 				uint32_t captured = control.frame - age;
 				ledger_note(relay_session, captured, child, LEDGER_B, err, 255, age);
 				/* Record the actual frozen grants, including non-USB helpers.
@@ -5953,8 +6331,15 @@ static void relay_broadcast_thread(void)
 					plan.rescue_child, plan.rescue_helper, age);
 				ledger_note(relay_session, captured, child, LEDGER_GRANT_HELPERS,
 					helpers, plan.rescue_age, age);
-				ledger_note(relay_session, captured, child, LEDGER_SURVEY_HISTORY,
-					plan.watch[age].survey, plan.watch[age].helpers[child], age);
+				ledger_note(
+					relay_session,
+					captured,
+					child,
+					LEDGER_SURVEY_HISTORY,
+					relay_plan_watch_const(&plan, age)->survey,
+					relay_plan_watch_const(&plan, age)->helpers[child],
+					age
+				);
 			}
 		}
 #endif

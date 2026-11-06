@@ -36,7 +36,17 @@ def relay_declarations(esb):
     publication = re.search(r"^struct tdma_publication \{.*?^\} tdma_staged;", esb, re.MULTILINE | re.DOTALL)
     if not publication:
         raise ValueError("tdma_publication/tdma_staged not found")
-    return "\n".join(['#include "relay_coord.c"', *state, stats.group(0), diag.group(0),
+    runtime_start = esb.index("static struct relay_runtime_settings relay_settings =")
+    runtime_end = esb.index("struct tdma_publication {", runtime_start)
+    runtime = esb[runtime_start:runtime_end]
+    # Settings persistence is exercised separately; staged/ACK fixtures use
+    # the actual runtime geometry and announcement helpers without NVS mocks.
+    load_start = runtime.index("static void relay_settings_load(")
+    runtime = runtime[:load_start]
+    defaults = "\n".join(("#define CONFIG_RELAY_MAX_TRACKERS 16", "#define CONFIG_RELAY_MAX_REPAIRS 1", "#define CONFIG_RELAY_REPAIR_FLOOR 0",
+                          "#define CONFIG_RELAY_SLOT_TICKS 16", "#define CONFIG_RELAY_TPS_MIN 100",
+                          "#define CONFIG_RELAY_TPS_MAX 120"))
+    return "\n".join(['#include "relay_coord.c"', '#include "relay_demand.h"', defaults, runtime, *state, stats.group(0), diag.group(0),
                       publication.group(0),
                       "#if defined(CONFIG_TDMA_DIAGNOSTICS)\nstatic uint32_t tdma_stats_generation[MAX_TRACKERS];\n#endif",
                       "#define relay_hid_packet hid_write_packet_n\n#define relay_defer_capture relay_coord_capture\n#define relay_defer_report relay_coord_report",

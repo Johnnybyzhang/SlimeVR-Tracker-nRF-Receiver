@@ -92,7 +92,7 @@ if 'pairing' in cases:
     declarations += '\n' + extract_block(live, r'^struct pairing_event\s*\{', semicolon=True)
 
 names = ['esb_auto_loss_invalidate',
-         'tdma_shadow_observe', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
+         'tdma_shadow_observe', 'tdma_admissible_mask', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
          'esb_send_remote_command_sens', 'esb_send_remote_command_sens_auto',
          'esb_send_remote_command_sens_auto_all', 'esb_send_remote_command_arg']
 if 'slots' in cases or 'pairing' in cases:

@@ -331,3 +331,22 @@ while direct receipts stop. Keep the child blocked and physically obstruct the p
 backup recovery. The console holds one block ID, so another block command replaces it. Clear each block with `relay block <id> 0`; disable with `relay v3 off`.
 Forced receiver drops test recovery behavior; peer RF coverage and D10/B/R0
 turnaround still require measurements on both tracker boards.
+
+### Runtime layout and wire version 4
+
+Wire version 4 consolidates the final runtime format. B remains 72 bytes.
+Byte 3 packs direct count minus one in bits 3-6, repair count in bits 0-2,
+and the experimental demand flag in bit 7. Byte 68 is the static slot width,
+or the demand maintenance-owner/width encoding. Bytes 69-70 carry the TPS
+cap. The flags byte announces the next two repair counts. Demand B carries
+five missing masks; static B retains three. The shared codec is authoritative.
+
+Trackers acquire through the private PONG geometry code and receive the exact
+cap and repair horizon from B. The PONG bootstrap supplies 120 TPS until B
+arrives; it is required for acquisition of this format. No intermediate wire
+version is accepted. Upstream non-relay profile 0 remains available.
+
+The descriptor is 30 bytes with self-contained geometry. Runtime settings
+persist and use staged activation. See scripts/relay-runtime.md for the static
+R5 default and experimental demand opt-in. Fifteen-tick slots require
+CONFIG_RELAY_EXPERIMENTAL_SLOT_15 and separate hardware validation.

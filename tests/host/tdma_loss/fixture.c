@@ -53,6 +53,10 @@ static int64_t k_uptime_get(void)
 static uint32_t k_uptime_get_32(void) { return (uint32_t)now; }
 /* 32768 Hz kernel ticks, as on the receiver. */
 static int64_t k_uptime_ticks(void) { return now * 32768 / 1000; }
+static uint32_t k_ticks_to_ms_ceil32(uint32_t ticks)
+{
+	return (uint32_t)(((uint64_t)ticks * 1000 + 32767) / 32768);
+}
 static uint32_t k_ms_to_ticks_ceil32(uint32_t ms) { return (uint32_t)(((uint64_t)ms * 32768 + 999) / 1000); }
 
 

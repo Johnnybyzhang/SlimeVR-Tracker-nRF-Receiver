@@ -76,7 +76,7 @@ declarations.append(extract.diagnostic_loss_declarations(source))
 declarations.append(relay_declarations(source))
 functions = [function(name) for name in (
     'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
-    'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
+    'tdma_admissible_mask', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
     'tdma_membership_wait_ms', 'tdma_slot_ticks_for', 'tdma_staging_supported_locked',
     'tdma_apply_locked', 'tdma_apply_finish', 'tdma_advertised_config', 'tdma_recalculate',
     'tracker_store_restore',
@@ -112,7 +112,7 @@ with tempfile.TemporaryDirectory(prefix='receiver-tdma-membership-') as director
     for diagnostics in (False, True):
         flags = ['-DCONFIG_TDMA_DIAGNOSTICS=1'] if diagnostics else []
         subprocess.run(compiler + [
-            '-std=c11', '-g', '-O1', '-Wall', '-Wextra',
+            '-DCONFIG_RELAY_RUNTIME_LAYOUT=1', '-std=c11', '-g', '-O1', '-Wall', '-Wextra',
             '-fsanitize=address,undefined', '-fno-omit-frame-pointer',
             '-fno-pie', '-no-pie', '-I', str(ROOT / 'src/connection'), *flags, str(generated), '-o', str(executable),
         ], check=True)

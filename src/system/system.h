@@ -16,6 +16,7 @@
 
 #define RF_CHANNEL 259  // NVS key for receiver RF channel
 #define TRACKER_ROSTER 260 // Versioned, atomic tracker roster
+#define RELAY_LAYOUT_SETTINGS 261 // Versioned runtime relay settings
 
 int sys_write_checked(uint16_t id, const void *data, size_t len);
 void sys_read(uint16_t id, void* data, size_t len);

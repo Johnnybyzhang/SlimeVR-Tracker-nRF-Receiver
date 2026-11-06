@@ -5,6 +5,15 @@
 #include "relay_coord.h"
 #define RC_BIT(id) (1U << (id))
 #include "grants_reference.inc"
+#ifdef COMPARE_CEDEEA0
+void cedeea0_relay_coord_plan_grants(struct relay_coord *, struct relay_control *, struct rc_grant_plan *, uint32_t);
+void cedeea0_relay_coord_finish_frozen(struct relay_control *, const struct rc_grant_plan *, uint8_t *);
+void cedeea0_relay_coord_commit_grants(
+	struct relay_coord *,
+	const struct relay_control *,
+	const struct rc_grant_plan *
+);
+#endif
 static uint32_t seed = 0x1d34f921;
 static uint32_t random_word(void)
 {
@@ -21,8 +30,15 @@ static uint8_t bitwise_crc(uint8_t v, const uint8_t *p, size_t n)
 }
 static void check_math(uint32_t origin, uint32_t frame, uint32_t tick)
 {
- assert(relay_frame_start(origin, frame) == origin + (uint32_t)((uint64_t)frame * 4096U / 15U));
- assert(relay_frame_at_tick(origin, tick) == (uint32_t)(((uint64_t)(uint32_t)(tick-origin)*15U+14U)/4096U));
+	assert(
+		relay_frame_start(origin, frame)
+		== origin + (uint32_t)((uint64_t)frame * RELAY_V3_GRID_TICKS / RELAY_V3_GRID_FRAMES)
+	);
+	assert(
+		relay_frame_at_tick(origin, tick)
+		== (uint32_t)(((uint64_t)(uint32_t)(tick - origin) * RELAY_V3_GRID_FRAMES + RELAY_V3_GRID_FRAMES - 1U)
+					  / RELAY_V3_GRID_TICKS)
+	);
 }
 int main(void)
 {
@@ -54,6 +70,11 @@ int main(void)
    a.maintenance_ms[id] = now - random_word() % 4001;
    a.report_ms[id] = now - random_word() % 1501;
    c.helpers[id] = random_word();
+   a.t[id].rssi = random_word() % 80;
+   for (unsigned h = 0; h < RC_MAX; h++) {
+	   a.peer[h][id]
+		   = (struct rc_peer){.expected = 100, .heard = random_word() % 101, .rssi_x8 = 100 + random_word() % 700};
+   }
   }
   for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
    unsigned i = (c.frame - age) % RELAY_V3_CACHE_FRAMES;
@@ -61,13 +82,22 @@ int main(void)
     .members = c.members, .survey = random_word() & c.members,
     .primary_valid = random_word() & c.members, .backup_valid = random_word() & c.members};
    if (run % 7 == 0) a.watch[i].frame = UINT32_MAX;
-   for (unsigned id = 0; id < RC_MAX; id++) a.watch[i].helpers[id] = random_word();
+   for (unsigned id = 0; id < RC_MAX; id++) {
+	   a.watch[i].helpers[id] = random_word();
+	   a.watch[i].listeners[id] = random_word() & c.members;
+	   a.watch[i].rescue_tried[id] = random_word() & c.members;
+   }
    a.receipt[i] = (struct rc_receipt){.frame = c.frame - age, .received = random_word()};
   }
   b = a;
   struct relay_control d = c;
   struct rc_grant_plan plan;
   relay_coord_plan_grants(&b, &d, &plan, now);
+#ifdef COMPARE_CEDEEA0
+  struct rc_grant_plan old_plan;
+  cedeea0_relay_coord_plan_grants(&a, &c, &old_plan, now);
+  assert(memcmp(&old_plan, &plan, sizeof(plan)) == 0);
+#endif
   uint8_t planned[RELAY_CONTROL_LEN];
   relay_control_encode(planned, &d);
   struct relay_control_crc_plan crc_plan = relay_control_plan_crc(planned);
@@ -77,7 +107,21 @@ int main(void)
    unsigned i = (c.frame - age) % RELAY_V3_CACHE_FRAMES;
    a.receipt[i].received = b.receipt[i].received = random_word();
   }
+#ifdef COMPARE_CEDEEA0
+  for (unsigned age = 0; age < RELAY_V3_CACHE_FRAMES; age++) {
+	  const struct rc_receipt *r = &a.receipt[old_plan.receipt_index[age]];
+	  if ((old_plan.valid & (1U << age)) && r->frame == old_plan.watch[age].frame) {
+		  c.missing[age] &= ~r->received;
+	  }
+  }
+  uint8_t old_wire[RELAY_CONTROL_LEN];
+  relay_control_encode(old_wire, &c);
+  cedeea0_relay_coord_finish_frozen(&c, &old_plan, old_wire);
+  relay_coord_read_grants(&c, old_wire);
+  cedeea0_relay_coord_commit_grants(&a, &c, &old_plan);
+#else
   reference_build_grants(&a, &c, now, &plan);
+#endif
   relay_coord_finish_grants(&b, &d, &plan);
   relay_coord_commit_grants(&b, &d, &plan);
   uint8_t x[RELAY_CONTROL_LEN], y[RELAY_CONTROL_LEN];

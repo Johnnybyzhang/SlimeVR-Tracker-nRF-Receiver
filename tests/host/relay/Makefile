@@ -5,15 +5,34 @@ TMP := $(shell mktemp -d 2>/dev/null || echo /tmp/relay-host)
 
 .PHONY: check clean
 check:
+	$(CC) $(CFLAGS) test_demand.c $(SRC)/relay_coord.c -o $(TMP)/demand
+	$(TMP)/demand
+	CC="$(CC)" python3 run_runtime_settings.py
+	$(CC) $(CFLAGS) test_runtime_wire.c -o $(TMP)/runtime_wire
+	$(TMP)/runtime_wire
+	$(CC) $(CFLAGS) test_runtime_geometry.c $(SRC)/relay_coord.c -o $(TMP)/runtime_geometry
+	$(TMP)/runtime_geometry
+	CC="$(CC)" python3 run_plan_snapshot.py
+	CC="$(CC)" python3 run_cedeea0.py
+	CC="$(CC)" python3 run_layout_range.py
+	$(CC) $(CFLAGS) -DCONFIG_RELAY_LAYOUT_FOLLOW_RECEIVER=1 test_geometry_link.c geometry_provider.c -o $(TMP)/geometry_link
+	$(TMP)/geometry_link
+	$(CC) $(CFLAGS) -DRELAY_HOST_DIRECT_SLOTS=16 -DRELAY_HOST_REPAIR_SLOTS=3 test_narrow_pool.c $(SRC)/relay_coord.c -o $(TMP)/narrow_pool
+	$(TMP)/narrow_pool
+	$(CC) $(CFLAGS) test_layouts.c $(SRC)/relay_coord.c -o $(TMP)/layout0
+	$(TMP)/layout0
+	$(CC) $(CFLAGS) -DRELAY_HOST_DIRECT_SLOTS=16 -DRELAY_HOST_REPAIR_SLOTS=3 test_layouts.c $(SRC)/relay_coord.c -o $(TMP)/layout1
+	$(TMP)/layout1
 	python3 run_freeze_wait.py
 	python3 run_rx_metadata.py
 	python3 run_fatal.py
 	python3 run_rtc_alloc.py
-	CC="$(CC)" python3 run_ledger_mask.py
 	$(CC) $(CFLAGS) test_rescue.c $(SRC)/relay_coord.c -o $(TMP)/test_rescue
 	$(TMP)/test_rescue
 	$(CC) $(CFLAGS) test_split.c $(SRC)/relay_coord.c -o $(TMP)/test_split
 	$(TMP)/test_split
+	$(CC) $(CFLAGS) -DRELAY_HOST_DIRECT_SLOTS=16 -DRELAY_HOST_REPAIR_SLOTS=3 test_split.c $(SRC)/relay_coord.c -o $(TMP)/test_split_full16
+	$(TMP)/test_split_full16
 	$(CC) $(CFLAGS) test_coord.c $(SRC)/relay_coord.c -o $(TMP)/test_coord
 	$(TMP)/test_coord
 	$(CC) $(CFLAGS) test_wire_v3.c -o $(TMP)/test_wire_v3

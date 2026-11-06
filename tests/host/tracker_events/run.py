@@ -198,7 +198,7 @@ def main():
         (path/'esb_membership_declarations.inc').write_text(declarations)
         membership = '\n'.join(function(esb, name) for name in (
             'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
-            'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked',
+            'tdma_admissible_mask', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked',
             'tdma_slot_ticks_for', 'tdma_staging_supported_locked', 'tdma_apply_locked',
             'tdma_apply_finish', 'tdma_recalculate'))
         lengths = function(esb, 'composite_body_length')

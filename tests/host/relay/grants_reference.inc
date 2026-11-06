@@ -3,7 +3,8 @@
 static void reference_maintenance(struct relay_coord *rc, struct relay_control *c, uint32_t now_ms,
 	uint32_t min_age)
 {
-	if (c->grants[0].owner != RELAY_OWNER_IDLE || c->grants[1].owner != RELAY_OWNER_IDLE) {
+	if (RELAY_V3_REPAIR_SLOTS < 2U || c->grants[0].owner != RELAY_OWNER_IDLE
+		|| c->grants[1].owner != RELAY_OWNER_IDLE) {
 		return;
 	}
 	int owner = -1;
@@ -28,17 +29,39 @@ static void reference_maintenance(struct relay_coord *rc, struct relay_control *
 
 void reference_build_grants(struct relay_coord *rc, struct relay_control *c, uint32_t now_ms, const struct rc_grant_plan *plan)
 {
-	for (unsigned i = 0; i < c->repair_count; i++) {
+	for (unsigned i = 0; i < RELAY_V3_REPAIR_MAX; i++) {
 		c->grants[i] = (struct relay_grant){.owner = RELAY_OWNER_IDLE};
 	}
 	c->maintenance_owner = RELAY_OWNER_IDLE;
 	c->flags &= ~RELAY_CONTROL_MAINTENANCE;
+#if RELAY_V3_REPAIR_SLOTS <= 3
+	for (unsigned age = 0; age < 3; age++) {
+		const struct rc_receipt *r = &rc->receipt[(c->frame - age) % 3];
+		if (rc->watch[(c->frame - age) % 3].frame == c->frame - age && r->frame == c->frame - age) {
+			c->missing[age] &= ~r->received;
+		}
+	}
+	if (!c->repair_count) {
+		return;
+	}
+	bool emergency = (c->missing[2] & plan->emergency_child) != 0;
+	uint8_t full_count = c->repair_count;
+	if (emergency) {
+		c->repair_count--;
+	}
+#endif
+
 	/* Commands and layouts must reach a member even when repairs fill every frame. */
 	reference_maintenance(rc, c, now_ms, RC_MAINTENANCE_URGENT_MS);
-	uint8_t count[RELAY_V3_REPAIR_SLOTS] = {0};
+	uint8_t count[RELAY_V3_REPAIR_MAX] = {0};
 	/* Oldest deadline first; group children sharing a helper into its grant. */
+#if RELAY_V3_REPAIR_SLOTS <= 3
+	for (int age = RELAY_V3_CACHE_FRAMES - 1; age >= 0; age--) {
+		for (unsigned copy = 0; copy < 2; copy++) {
+#else
 	for (unsigned copy = 0; copy < 2; copy++) {
 		for (int age = RELAY_V3_CACHE_FRAMES - 1; age >= 0; age--) {
+#endif
 			uint32_t frame = c->frame - age;
 			struct rc_watch *w = &rc->watch[frame % RELAY_V3_CACHE_FRAMES];
 			if (w->frame != frame) {
@@ -53,7 +76,17 @@ void reference_build_grants(struct relay_coord *rc, struct relay_control *c, uin
 				if (!(missing & (1U << child))) {
 					continue;
 				}
-				uint8_t helper = (w->helpers[child] >> (copy * 4U)) & 15U;
+				unsigned choice = copy;
+				if (age > 0 && !(c->frame & 1U) && (w->primary_valid & RC_BIT(child))
+					&& (w->backup_valid & RC_BIT(child))) {
+					choice ^= 1U;
+				}
+				uint8_t helper = (w->helpers[child] >> (choice * 4U)) & 15U;
+				if (age > 0 && copy == 0 && plan->rescue_age == age && plan->rescue_child == (1U << child)
+					&& (w->rescue_tried[child] & (1U << helper))
+					&& !(w->rescue_tried[child] & (1U << plan->rescue_helper))) {
+					helper = plan->rescue_helper;
+				}
 				unsigned slot, idle = c->repair_count;
 				for (slot = 0; slot < c->repair_count; slot++) {
 					if (c->grants[slot].owner == helper && count[slot] < RELAY_MAX_CHILDREN) {
@@ -90,12 +123,19 @@ void reference_build_grants(struct relay_coord *rc, struct relay_control *c, uin
 		int best = -1;
 		for (unsigned offset = 0; offset < RC_MAX; offset++) {
 			unsigned child = (rc->survey_next + offset) % RC_MAX;
-			if (!(c->members & RC_BIT(child)) || !rc->t[child].direct_permille ||
-			    rc->t[child].direct_permille >= RC_HEAD_MIN_PERMILLE) continue;
+			if (!(c->members & RC_BIT(child)) || (!rc->t[child].direct_permille && !(c->expected & RC_BIT(child)))
+				|| rc->t[child].direct_permille >= RC_HEAD_MIN_PERMILLE) {
+				continue;
+			}
 			if (best < 0 || rc->t[child].direct_permille < rc->t[best].direct_permille)
 				best = child;
 		}
-		if (best >= 0) c->survey = RC_BIT(best);
+		if (best >= 0) {
+			c->survey = RC_BIT(best);
+			if (!rc->t[best].direct_permille) {
+				rc->survey_next = (best + 1U) % RC_MAX;
+			}
+		}
 	}
 	uint16_t failed = c->missing[0] & plan->fresh_survey;
 	for (unsigned age = 1; age < RELAY_V3_CACHE_FRAMES; age++) {
@@ -150,19 +190,48 @@ void reference_build_grants(struct relay_coord *rc, struct relay_control *c, uin
 			break;
 		}
 	}
-	if (plan->rescue_child) {
-		uint16_t reserved = 0;
-		for (unsigned slot = 0; slot < c->repair_count; slot++) {
-			unsigned helper = c->grants[slot].owner;
-			if ((helper == plan->rescue_helper || helper == plan->rescue_second) &&
-			    (c->grants[slot].children & plan->rescue_child)) reserved |= RC_BIT(helper);
+#if RELAY_V3_REPAIR_SLOTS <= 3
+	if (!emergency && c->repair_count == 3 && !(c->flags & RELAY_CONTROL_MAINTENANCE)) {
+		struct relay_grant original[3];
+		memcpy(original, c->grants, sizeof(original));
+		for (unsigned slot = 0; slot < 3; slot++) {
+			c->grants[slot] = original[(slot + c->frame) % 3];
 		}
-		unsigned frame = c->frame - plan->rescue_age;
-		if (reserved && rc->watch[frame % 3].frame == frame) {
-			if (rc->watch[frame % 3].rescue_child != plan->rescue_child)
-				rc->watch[frame % 3].rescue_helpers = 0;
-			rc->watch[frame % 3].rescue_child = plan->rescue_child;
-			rc->watch[frame % 3].rescue_helpers |= reserved;
+	}
+#endif
+#if RELAY_V3_REPAIR_SLOTS <= 3
+	c->repair_count = full_count;
+	if (emergency && !(full_count <= 2 && (c->flags & RELAY_CONTROL_MAINTENANCE))) {
+		c->grants[full_count - 1] = (struct relay_grant){
+			plan->emergency_helper,
+			plan->emergency_coverage & (c->missing[0] | c->missing[1] | c->missing[2])
+		};
+	}
+#endif
+	for (unsigned age = 0; age < 3; age++) {
+		unsigned frame = c->frame - age;
+		struct rc_watch *w = &rc->watch[frame % 3];
+		if (w->frame != frame || w->session != c->session || w->epoch != c->epoch || w->members != c->members) {
+			continue;
+		}
+		for (unsigned child = 0; child < RC_MAX; child++) {
+			if (!(c->missing[age] & RC_BIT(child))) {
+				continue;
+			}
+			for (unsigned slot = 0; slot < c->repair_count; slot++) {
+				unsigned helper = c->grants[slot].owner;
+				if (helper < RC_MAX && (c->grants[slot].children & RC_BIT(child))) {
+#if RELAY_V3_REPAIR_SLOTS <= 3
+					if (!slot && !(w->rescue_tried[child] & RC_BIT(helper))) {
+						w->r0_only[child] |= RC_BIT(helper);
+					}
+					if (slot) {
+						w->r0_only[child] &= ~RC_BIT(helper);
+					}
+#endif
+					w->rescue_tried[child] |= RC_BIT(helper);
+				}
+			}
 		}
 	}
 	struct rc_watch *next = &rc->watch[(c->frame + 1U) % RELAY_V3_CACHE_FRAMES];

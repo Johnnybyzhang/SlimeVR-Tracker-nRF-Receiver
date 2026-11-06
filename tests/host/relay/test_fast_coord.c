@@ -35,7 +35,7 @@ int main(void)
 	relay_coord_init(&rc);
 	assert(!rc.v3_requested && !relay_coord_v3_ready(&rc, 1));
 	for (unsigned id = 0; id < RC_MAX; id++) {
-		relay_coord_note_caps(&rc, id, RELAY_CAP_HELPER | (3U << RELAY_CAP_VERSION_SHIFT));
+		relay_coord_note_caps(&rc, id, RELAY_CAP_HELPER | (RELAY_V3_VERSION << RELAY_CAP_VERSION_SHIFT));
 		assert(!relay_coord_v3_ready(&rc, (uint16_t)(1U << id)));
 	}
 	rc.v3_requested = true;
@@ -43,7 +43,7 @@ int main(void)
 		assert(relay_coord_v3_ready(&rc, (uint16_t)(1U << id)));
 	}
 	assert(relay_coord_v3_ready(&rc, 0x83FF));
-	assert(!relay_coord_v3_ready(&rc, 0xFFFF) && !relay_coord_v3_ready(&rc, 0));
+	assert(relay_coord_v3_ready(&rc, 0xFFFF) && !relay_coord_v3_ready(&rc, 0));
 	relay_coord_note_caps(&rc, 15, RELAY_CAP_HELPER | (RELAY_PROTOCOL_VERSION << RELAY_CAP_VERSION_SHIFT));
 	assert(rc.t[15].capable && !relay_coord_v3_ready(&rc, 0x8001));
 	relay_coord_note_caps(&rc, 15, 0xF1);

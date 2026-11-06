@@ -104,12 +104,17 @@ def membership_declarations(source):
     ))
 
 
+# These two read relay and staging state, which is declared later.
+LATE_MEMBERSHIP = ('tdma_admissible_mask', 'tdma_membership_wait_ms')
+
+
 def membership_bodies(source):
-    return '\n'.join(function(source, name) for name in (
+    prototypes = ('static uint32_t tdma_admissible_mask(uint32_t desired);\n'
+                  'static uint32_t tdma_membership_wait_ms(uint32_t maximum_ms);')
+    return '\n'.join((prototypes, *(function(source, name) for name in (
         'tdma_shadow_observe', 'tdma_shadow_forget_tracker',
         'tdma_shadow_merge_locked', 'tdma_shadow_update',
-        'tdma_membership_wait_ms',
-    ))
+    ))))
 
 
 
@@ -221,6 +226,7 @@ static void restart_ping(uint8_t tracker_id) {
         function(source, 'esb_receive_composite'),
         function(source, 'esb_receive_normal', optional=True),
         staging_helpers(source, recalc=True) if relay else '',
+        *(function(source, name) for name in LATE_MEMBERSHIP),
         function(source, 'tdma_recalculate'),
         admission,
     ))

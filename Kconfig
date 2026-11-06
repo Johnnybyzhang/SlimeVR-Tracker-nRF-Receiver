@@ -173,12 +173,10 @@ endmenu
 
 source "Kconfig.zephyr"
 
-config RELAY_FRAME_LEDGER
-    bool "Bounded per-frame relay ledger"
+config RELAY_RESCUE_DIAGNOSTICS
+    bool "Rescue candidate eligibility ledger"
     default n
-    help
-        Retain local relay events in RAM for post-capture console inspection.
-        Diagnostic images only; no logging or formatting in radio paths.
+    depends on RELAY_FRAME_LEDGER
 
 config RELAY_CYCLE_DIAGNOSTICS
     bool "Detailed relay CPU cycle diagnostics"
@@ -194,3 +192,52 @@ config RELAY_IRQ_DIAGNOSTICS
     help
         Diagnostic-only DWT maxima for complete source or coordinator locks.
         Retains all production guards. Never enable for acceptance images.
+
+config RELAY_RUNTIME_LAYOUT
+    bool
+    default y
+
+config RELAY_MAX_TRACKERS
+    int "Maximum private relay members"
+    range 1 16
+    default 11
+
+config RELAY_MAX_REPAIRS
+    int "Maximum ordinary repair slots"
+    range 0 5
+    default 5
+
+config RELAY_REPAIR_FLOOR
+    int "Minimum ordinary repair slots (experimental below ceiling)"
+    range 0 5
+    default RELAY_MAX_REPAIRS
+    help
+      Equal to the ceiling selects production static repair. Lower values
+      explicitly opt into experimental on-demand repair.
+
+config RELAY_EXPERIMENTAL_SLOT_15
+    bool "Allow experimental 15-tick relay slots"
+    default n
+
+config RELAY_SLOT_TICKS
+    int "Private relay slot width"
+    range 15 16 if RELAY_EXPERIMENTAL_SLOT_15
+    range 16 16 if !RELAY_EXPERIMENTAL_SLOT_15
+    default 16
+
+config RELAY_TPS_MIN
+    int "Guaranteed private relay TPS floor"
+    range 1 32768
+    default 100
+
+config RELAY_TPS_MAX
+    int "Private relay TPS cap"
+    range 1 32768
+    default 120
+
+config RELAY_FORCE_FULL_FLEET_PLAN
+    bool "Plan B at the full-fleet lead"
+    default n
+    help
+        Exercise live direct-slot planning even with a partially populated fleet.
+        Applies to every runtime layout when enabled.

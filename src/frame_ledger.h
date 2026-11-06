@@ -17,6 +17,9 @@ enum ledger_event {
 	LEDGER_RESCUE_PLAN = 34,
 	LEDGER_GRANT_HELPERS = 35,
 	LEDGER_SURVEY_HISTORY = 36,
+	LEDGER_CANDIDATE_FLAGS = 37,
+	LEDGER_CANDIDATE_UPLINK = 38,
+	LEDGER_CANDIDATE_RANK = 39,
 };
 #ifdef CONFIG_RELAY_FRAME_LEDGER
 void ledger_note(uint32_t session, uint32_t frame, uint8_t child,

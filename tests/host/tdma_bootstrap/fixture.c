@@ -78,6 +78,10 @@ static int64_t k_uptime_get(void) { return (int64_t)now_ms; }
 static uint32_t k_uptime_get_32(void) { return (uint32_t)now_ms; }
 /* 32768 Hz kernel ticks, as on the receiver. */
 static int64_t k_uptime_ticks(void) { return (int64_t)now_ms * 32768 / 1000; }
+static uint32_t k_ticks_to_ms_ceil32(uint32_t ticks)
+{
+	return (uint32_t)(((uint64_t)ticks * 1000 + 32767) / 32768);
+}
 static uint32_t k_ms_to_ticks_ceil32(uint32_t ms) { return (uint32_t)(((uint64_t)ms * 32768 + 999) / 1000); }
 static uint8_t stored_trackers, saved_count;
 static uint64_t stored_tracker_addr[MAX_TRACKERS], saved_addr[MAX_TRACKERS];
@@ -577,6 +581,110 @@ static void staged_publication(void)
     tdma_staged.valid = false;
 }
 
+static void runtime_settings_publication(void)
+{
+	two_member_layout(3, true);
+	now_ms = 6000;
+	service();
+	assert(tdma_active_mask == 7 && !tdma_staged.valid);
+	relay_settings = (struct relay_runtime_settings){2, 1, 16, 100, 120};
+	relay_settings_generation++;
+	relay_coord.v3_requested = true;
+	force_layout();
+	assert(tdma_staged.valid && !relay_profile && tdma_staged.p.profile == 1);
+	assert(tdma_staged.p.new_mask == 3 && tdma_staged.p.geometry.direct == 2);
+	uint32_t requested = relay_settings_generation;
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1;
+	service();
+	assert(relay_profile == 1 && tdma_active_mask == 3 && relay_geometry_current()->direct == 2);
+	assert(relay_applied_generation == requested && relay_applied_settings.max_repairs == 1);
+	uint32_t frame = relay_timeline_active.frame, start;
+	assert(relay_timeline_start(&relay_timeline_active, frame, &start));
+	assert(start == tdma_staged.activation_ticks);
+	assert(ping(0, true) && ping(1, true) && ping(2, true));
+	service();
+	relay_settings.max_trackers = 3;
+	relay_settings.max_repairs = 5;
+	relay_settings.repair_floor = 5;
+	relay_settings_generation++;
+	force_layout();
+	assert(tdma_staged.valid && tdma_staged.p.settings.max_repairs == 5 && tdma_staged.p.geometry.direct == 3);
+	assert(relay_applied_settings.max_repairs == 1 && relay_geometry_current()->direct == 2);
+	relay_settings.max_repairs = 3;
+	relay_settings.repair_floor = 3;
+	relay_settings_generation++;
+	force_layout();
+	assert(tdma_staged.p.settings.max_repairs == 5); /* An in-flight publication is immutable. */
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1;
+	service();
+	assert(relay_applied_settings.max_repairs == 5 && relay_geometry_current()->direct == 3);
+	assert(tdma_staged.valid && tdma_staged.p.settings.max_repairs == 3);
+	assert(relay_timeline_active.frame > frame);
+	frame = relay_timeline_active.frame;
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1;
+	service();
+	assert(relay_applied_settings.max_repairs == 3 && relay_applied_generation == relay_settings_generation);
+	assert(!tdma_staged.valid && relay_timeline_active.frame > frame);
+	/* The new R must seed the first interval, even when occupied time
+	 * dominates the cap and the old R would make a shorter frame. */
+	relay_applied_settings.max_repairs = 1;
+	struct tdma_publication full
+		= {.new_mask = 0xffff,
+		   .active_count = 16,
+		   .profile = 1,
+		   .slot_ticks = 16,
+		   .epoch = (uint8_t)(relay_epoch + 1),
+		   .settings = {16, 3, 16, 100, 120, 3},
+		   .settings_generation = relay_settings_generation + 1};
+	assert(relay_geometry_make(&full.geometry, 16, 3, 16, 120));
+	tdma_staged.activation_ticks = ticks_at(now_ms) + 1000;
+	unsigned key = irq_lock();
+	tdma_apply_locked(&full, now_ms);
+	irq_unlock(key);
+	uint32_t next;
+	assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame, &start));
+	assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame + 1, &next));
+	assert(next - start == 320 && relay_applied_settings.max_repairs == 3);
+	puts("PASS runtime settings activation: ranked member cap, immutable pending settings and monotonic frame epochs");
+}
+
+/* Phase-2 receiver hang: a live member above max_trackers kept the raw
+ * desired mask different from the admitted one, re-arming an expired
+ * membership deadline forever, and a pending stage was waited for with zero
+ * timeouts. Either made the stats owner spin and starve the console. */
+static void member_cap_owner_blocks(void)
+{
+	two_member_layout(3, true);
+	now_ms = 6000;
+	service();
+	assert(tdma_active_mask == 7 && !tdma_staged.valid);
+	relay_settings = (struct relay_runtime_settings){2, 1, 16, 100, 120, 0};
+	relay_settings_generation++;
+	relay_coord.v3_requested = true;
+	force_layout();
+	assert(tdma_staged.valid && tdma_staged.p.new_mask == 3);
+	for (unsigned ms = 0; ms + 10 < RELAY_LAYOUT_ACTIVATION_MS; ms += 10) {
+		now_ms += 10;
+		assert(ping(0, true) && ping(1, true) && ping(2, true));
+		service();
+		assert(tdma_staged.valid);
+		uint32_t wait = tdma_membership_wait_ms(500);
+		assert(wait > 0 && wait <= RELAY_LAYOUT_ACTIVATION_MS - ms);
+	}
+	now_ms += 20;
+	service();
+	assert(!tdma_staged.valid && relay_profile == 1 && tdma_active_mask == 3);
+	for (unsigned ms = 0; ms < 2000; ms += 10) {
+		now_ms += 10;
+		assert(ping(0, true) && ping(1, true) && ping(2, true));
+		service();
+		assert(tdma_active_mask == 3 && !tdma_membership_deadline_armed);
+		assert(tdma_membership_wait_ms(500) == 500);
+	}
+	relay_coord.v3_requested = false;
+	puts("PASS member cap: owner sleeps while staged and with live members above max_trackers");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -596,7 +704,9 @@ int main(int argc, char **argv)
     owner_store_lock_delay();
     restore_retry();
     staged_publication();
-    puts("PASS staged layout publication: announce, serialize, activate, legacy and forced");
-    puts("Receiver membership admission cases passed");
-    return 0;
+	runtime_settings_publication();
+	member_cap_owner_blocks();
+	puts("PASS staged layout publication: announce, serialize, activate, legacy and forced");
+	puts("Receiver membership admission cases passed");
+	return 0;
 }

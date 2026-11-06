@@ -16,7 +16,7 @@ static void control(void)
 		c.grants[i] = (struct relay_grant){15, 1};
 	}
 	assert(relay_control_encode(bytes, &c) == 72);
-	assert(bytes[0] == 0xE8 && bytes[1] == 3 && bytes[4] == 0x12 && bytes[7] == 0x78);
+	assert(bytes[0] == 0xE8 && bytes[1] == RELAY_V3_VERSION && bytes[4] == 0x12 && bytes[7] == 0x78);
 	assert(bytes[12] == 0xDE && bytes[15] == 0xEF && bytes[30] == 0x2F);
 	assert(bytes[46] == 15 && bytes[51] == 0 && bytes[52] == 1);
 	assert(RELAY_CONTROL_OFF_OWNERS == 46 && RELAY_CONTROL_OFF_CHILDREN == 51);
@@ -95,10 +95,14 @@ static void descriptors(void)
 		.members = 0x8001, .expected = 0x8001, .slot_ticks = 16, .repair_count = 5,
 		.origin_ticks = 0xFFFFFF80, .activation_ticks = 123, .frame_seed = 65535};
 	struct relay_layout_descriptor decoded;
-	assert(relay_layout_encode(bytes, &d) == 26 && relay_layout_decode(bytes, 26, &decoded));
+	assert(
+		relay_layout_encode(bytes, &d) == RELAY_LAYOUT_LEN && relay_layout_decode(bytes, RELAY_LAYOUT_LEN, &decoded)
+	);
 	assert(decoded.session == d.session && decoded.frame_seed == d.frame_seed);
-	for (unsigned i = 0; i < 26; i++) {
-		bytes[i] ^= 1; assert(!relay_layout_decode(bytes, 26, &decoded)); bytes[i] ^= 1;
+	for (unsigned i = 0; i < RELAY_LAYOUT_LEN; i++) {
+		bytes[i] ^= 1;
+		assert(!relay_layout_decode(bytes, RELAY_LAYOUT_LEN, &decoded));
+		bytes[i] ^= 1;
 	}
 	struct relay_peer_report r = {.helper = 15, .epoch = 255, .session = 0x12345678, .count = 8};
 	for (unsigned i = 0; i < 8; i++) {

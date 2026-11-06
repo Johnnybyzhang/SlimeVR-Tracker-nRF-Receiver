@@ -133,7 +133,8 @@ enum { RC_ROLE_NONE, RC_ROLE_HEAD, RC_ROLE_CHILD };
 struct rc_watch {
 	uint32_t frame, session;
 	uint16_t members, survey;
-	uint16_t rescue_child, rescue_helpers;
+	uint16_t rescue_tried[RC_MAX];
+	uint16_t r0_only[RC_MAX];
 	uint16_t listeners[RC_MAX];
 	uint8_t epoch;
 	uint16_t primary_valid, backup_valid;
@@ -171,18 +172,37 @@ struct rc_grant_plan {
 	uint8_t rescue_helper, rescue_second, rescue_age;
 	int8_t maintenance, reporter;
 	uint8_t survey_next, valid;
-	uint8_t receipt_index[RELAY_V3_CACHE_FRAMES];
+	uint8_t receipt_index[RELAY_CACHE_MAX_FRAMES];
 	bool urgent;
+	uint16_t emergency_child, emergency_coverage;
+	uint8_t emergency_helper;
+	uint16_t demand_eligible[5];
+	uint16_t fresh_coverage[RC_MAX];
+	uint8_t fresh_helper[RC_MAX];
+	uint32_t demand_candidates[5];
+	uint32_t demand_children[5][RC_MAX];
+	uint8_t demand_helper[5][32];
+	struct rc_watch watch_extra[2];
 };
 
+static inline struct rc_watch *relay_plan_watch(struct rc_grant_plan *p, unsigned age)
+{
+	return age < 3 ? &p->watch[age] : &p->watch_extra[age - 3];
+}
+static inline const struct rc_watch *relay_plan_watch_const(const struct rc_grant_plan *p, unsigned age)
+{
+	return age < 3 ? &p->watch[age] : &p->watch_extra[age - 3];
+}
+
 struct relay_coord {
+	uint8_t cache_frames;
 	struct rc_peer peer[RC_MAX][RC_MAX]; /* helper -> child */
 	struct rc_choice choice[RC_MAX][2];
 	uint16_t learn_members;
 	uint8_t survey_next, report_next;
 	uint32_t report_ms[RC_MAX];
-	struct rc_watch watch[RELAY_V3_CACHE_FRAMES];
-	struct rc_receipt receipt[RELAY_V3_CACHE_FRAMES];
+	struct rc_watch watch[RELAY_CACHE_MAX_FRAMES];
+	struct rc_receipt receipt[RELAY_CACHE_MAX_FRAMES];
 	uint32_t maintenance_ms[RC_MAX];
 	uint8_t maintenance_next;
 	uint32_t published[RC_MAX];
@@ -219,6 +239,7 @@ bool relay_coord_publish(struct relay_coord *rc, uint8_t id, uint32_t frame);
 void relay_coord_plan_watch(struct relay_coord *rc, struct relay_control *control);
 void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 	struct rc_grant_plan *plan, uint32_t now_ms);
+void relay_coord_finish_static_frozen(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire);
 void relay_coord_finish_frozen(struct relay_control *c, const struct rc_grant_plan *plan, uint8_t *wire);
 void relay_coord_read_grants(struct relay_control *c, const uint8_t *wire);
 void relay_coord_commit_grants(struct relay_coord *rc, const struct relay_control *control,
