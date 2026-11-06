@@ -30,11 +30,12 @@ parser.add_argument('--repairs', type=int, choices=range(6), default=5)
 parser.add_argument('--max-trackers', type=int, choices=range(1,17), default=16)
 parser.add_argument('--slot-ticks', type=int, choices=(15,16), default=16)
 parser.add_argument('--tps-max', type=int, default=120)
+parser.add_argument('--second-b',type=int,choices=(0,1,2),default=0)
 parser.add_argument('--on-demand', action='store_true')
 args = parser.parse_args()
 if not 1 <= args.tps_max <= 32768:
     parser.error('--tps-max must be 1..32768')
-fixture_flags = ['-DRELAY_BENCH_DEMAND='+str(int(args.on_demand)),'-DRELAY_HOST_REPAIR_SLOTS='+str(args.repairs),
+fixture_flags = ['-DRELAY_BENCH_SECOND_B='+str(args.second_b),'-DRELAY_BENCH_DEMAND='+str(int(args.on_demand)),'-DRELAY_HOST_REPAIR_SLOTS='+str(args.repairs),
                  '-DRELAY_HOST_DIRECT_SLOTS='+str(args.max_trackers),
                  '-DRELAY_BENCH_MAX_MEMBERS='+str(args.max_trackers),
                  '-DRELAY_HOST_SLOT_TICKS='+str(args.slot_ticks),
@@ -42,7 +43,7 @@ fixture_flags = ['-DRELAY_BENCH_DEMAND='+str(int(args.on_demand)),'-DRELAY_HOST_
 objdump = os.environ.get('ARM_OBJDUMP', str(root.parent / 'tools/zephyr-sdk-1.0.1/gnu/arm-zephyr-eabi/bin/arm-zephyr-eabi-objdump'))
 u = Uc(UC_ARCH_ARM, UC_MODE_THUMB | UC_MODE_MCLASS)
 u.ctl_set_cpu_model(UC_CPU_ARM_CORTEX_M4)
-for address, size in [(0x21000000, 0x20000), (0, 0x100000), (0x10000000, 0x10000), (0x20000000, 0x40000),
+for address, size in [(0x21000000,0x20000), (0, 0x100000), (0x10000000, 0x10000), (0x20000000, 0x40000),
                       (0x40000000, 0x200000), (0x50000000, 0x100000), (0xe0000000, 0x100000)]:
     u.mem_map(address, size)
 
@@ -200,12 +201,12 @@ u.mem_write(sym['relay_profile.lto_priv.0'], b'\x01')
 # Ledger images extend beyond the historical fixed 0x20028000 placement.
 assert sym['_image_ram_end'] < 0x2003c000, 'Device overlaps model scratch'
 fixture_ram = 0x21000000
-initial_ram = bytes(u.mem_read(0x20000000, sym['_image_ram_end'] - 0x20000000))
+initial_ram = bytes(u.mem_read(0x20000000,sym['_image_ram_end']-0x20000000))
 initial_peripherals = bytes(u.mem_read(0x40000000, 0x20000))
 with tempfile.TemporaryDirectory(prefix='relay-arm-model-') as temporary:
     temporary = Path(temporary)
     fixture = temporary / 'fixture.elf'
-    environment = dict(os.environ, BENCH_DEMAND=str(int(args.on_demand)), BENCH_EXPORT=str(fixture), BENCH_TEXT_ORIGIN='0x80000', BENCH_RAM_ORIGIN=hex(fixture_ram), BENCH_REPAIR_SLOTS=str(args.repairs),
+    environment = dict(os.environ, BENCH_SECOND_B=str(args.second_b), BENCH_DEMAND=str(int(args.on_demand)), BENCH_EXPORT=str(fixture), BENCH_TEXT_ORIGIN='0x80000', BENCH_RAM_ORIGIN=hex(fixture_ram), BENCH_REPAIR_SLOTS=str(args.repairs),
                        BENCH_MAX_MEMBERS=str(args.max_trackers), BENCH_SLOT_TICKS=str(args.slot_ticks),
                        BENCH_TPS_MAX=str(args.tps_max))
     subprocess.run([sys.executable, str(here / 'bench_cycles.py')], env=environment, check=True)
@@ -214,7 +215,7 @@ with tempfile.TemporaryDirectory(prefix='relay-arm-model-') as temporary:
         for segment in fixture_elf.iter_segments():
             address, size = segment['p_vaddr'], segment['p_memsz']
             if segment['p_type'] == 'PT_LOAD' and size and address >= 0x20000000:
-                assert fixture_ram <= address and address + size <= fixture_ram + 0x1c000, 'Fixture overlaps model scratch'
+                assert fixture_ram <= address and address + size <= fixture_ram+0x1c000, 'Fixture overlaps model scratch'
     print(f'Device RAM ends at {sym["_image_ram_end"]:#x}; fixture RAM starts at {fixture_ram:#x}')
     bench = {name: value[0] for name, value in load(fixture).items()}
     sym['setup'] = bench['setup']
@@ -239,6 +240,7 @@ int main(int argc, char **argv) {
     subprocess.run([os.environ.get('CC', 'cc'), '-O2', *fixture_flags, '-Wno-unknown-attributes', '-I', str(here), '-I', str(root / 'src/connection'), str(golden_c), str(root / 'src/connection/relay_coord.c'), '-o', str(golden_exe)], check=True)
     golden = subprocess.check_output([str(golden_exe), str(args.seeds)])
     maximum, worst_seed, worst_phases = 0, 0, {}
+    repeat_arm_max=repeat_encode_max=0
     arm_max, encode_max = 0, 0
     member_maxima = {}
     payload, work, event = 0x2003c000, 0x2003c100, 0x40011144
@@ -295,6 +297,36 @@ int main(int argc, char **argv) {
         assert (0x4000a144, 0x40001000) in endpoints, (hex(enabled), endpoints)
         if cycles > maximum:
             maximum, worst_seed, worst_phases = cycles, seed, dict(phases)
+        if args.second_b:
+            # The copy is built before its own freeze. Measure that work and
+            # the actual repeat arm entry separately against the same ceilings.
+            source = 0x2003c200
+            u.mem_write(source, actual)
+            at = int.from_bytes(actual[12:16],'big') + ((args.repairs+1)*args.slot_ticks if args.second_b==2 else args.slot_ticks)
+            call('relay_repeat_encode', payload+5, source, at & 0xffffffff, measure=True)
+            repeat_encode_max=max(repeat_encode_max,cycles+24)
+            repeat=bytes(u.mem_read(payload+5,72))
+            assert repeat[0]==0xec and repeat[1:12]==actual[1:12] and repeat[16:71]==actual[16:71]
+            check=7
+            for byte in repeat[:71]:
+                check ^= byte
+                for _ in range(8):check=((check<<1) ^ (7 if check&128 else 0))&255
+            assert repeat[71]==check
+            # Model completion of copy 1's bounded PRX restoration, then
+            # prepare copy 2 through the same linked SDK entry points.
+            u.mem_write(0x20000000,initial_ram)
+            u.mem_write(0x40000000,initial_peripherals)
+            disable_ready=None
+            u.mem_write(payload,bytes([72,1,0,1,0])+repeat)
+            assert call('esb_prx_broadcast_prepare',payload)
+            generation=read32(sym['relay_layout_generation.lto_priv.0'])
+            assert call('relay_repeat_arm',event,generation+1) & 0x80000000
+            assert read32(sym['radio_operation_busy.lto_priv.0'])==0
+            assert call('relay_repeat_arm',event,generation,measure=True)==0
+            repeat_arm_max=max(repeat_arm_max,cycles+24)
+    if args.second_b:
+        print('second B arm/encode:',repeat_arm_max,repeat_encode_max)
+        assert repeat_arm_max<=1130 and repeat_encode_max<=805
     # Failures must not steal another owner's radio, or leak our ownership.
     for failure in ('stale', 'busy', 'not_prx', 'late', 'reinit', 'disabled_stuck', 'disabled_late'):
         u.mem_write(0x20000000, initial_ram)

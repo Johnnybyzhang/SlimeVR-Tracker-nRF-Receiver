@@ -623,10 +623,11 @@ static struct relay_runtime_settings relay_settings = {
 	CONFIG_RELAY_TPS_MIN,
 	CONFIG_RELAY_TPS_MAX,
 	CONFIG_RELAY_REPAIR_FLOOR,
+	0,
 };
 static struct relay_runtime_settings relay_applied_settings;
 static uint32_t relay_settings_generation = 1, relay_applied_generation;
-static struct relay_geometry relay_receiver_geometry = {16, 1, 16, 120, 288, 1};
+static struct relay_geometry relay_receiver_geometry = {16, 1, 16, 120, 288, 1, 0};
 const struct relay_geometry *relay_geometry_active = &relay_receiver_geometry;
 struct relay_timeline relay_timeline_active;
 
@@ -657,6 +658,14 @@ static void relay_frame_announce(uint32_t frame, uint32_t start)
 		RELAY_V3_SLOT_TICKS,
 		relay_geometry_current()->tps
 	);
+	relay_runtime_anchor_second_b(
+		&a,
+		relay_frame_repairs(frame),
+		relay_frame_repairs(frame + 1U),
+		relay_frame_repairs(frame + 2U),
+		relay_geometry_current()->tps,
+		relay_applied_settings.second_b
+	);
 	relay_timeline_announce(&relay_timeline_active, &a);
 }
 
@@ -669,25 +678,33 @@ static void relay_settings_load(void)
 		value = (struct relay_runtime_settings){
 			record[1],
 			record[2],
-			record[3],
+			record[0] == 3U ? record[3] & 63U : record[3],
 			relay_get_be16(record + 4),
 			relay_get_be16(record + 6),
-			record[2]
+			record[2],
+			0
 		};
 	}
-	if (length == sizeof(record) && record[0] == 2U && record[9] == relay_crc8(7, record, 9)) {
+	if (length == sizeof(record) && (record[0] == 2U || record[0] == 3U) && record[9] == relay_crc8(7, record, 9)) {
 		value = (struct relay_runtime_settings){
 			record[1],
 			record[2],
-			record[3],
+			record[0] == 3U ? record[3] & 63U : record[3],
 			relay_get_be16(record + 4),
 			relay_get_be16(record + 6),
-			record[8]
+			record[8],
+			record[0] == 3U ? record[3] >> 6 : 0U
 		};
 	}
+	/* Migrate only the exact historical default tuple. Other choices survive. */
+	if ((length == 9 || length == 10) && record[0] <= 2U && value.max_trackers == 11 && value.max_repairs == 5
+		&& value.slot_ticks == 16 && value.tps_min == 100 && value.tps_max == 120 && value.repair_floor == 5) {
+		value.max_trackers = 16;
+		value.tps_min = 120;
+	}
 	if (!relay_runtime_validate(&value, IS_ENABLED(CONFIG_RELAY_EXPERIMENTAL_SLOT_15))) {
-		value = (struct relay_runtime_settings){11, 5, 16, 100, 120, 5};
-		LOG_WRN("Invalid relay settings; using static 11/5/16/100/120 defaults");
+		value = (struct relay_runtime_settings){16, 5, 16, 120, 120, 5, 0};
+		LOG_WRN("Invalid relay settings; using 120-mode defaults");
 	}
 	relay_settings = value;
 }
@@ -849,8 +866,8 @@ static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
 	}
 	relay_forward_published = p->forward_mask;
 	relay_coord_set_forward_layout(&relay_coord, p->forward_mask);
-	relay_applied_settings = p->settings;
-	relay_coord.cache_frames = p->settings.repair_floor < p->settings.max_repairs ? 5 : 3;
+	relay_applied_settings = relay_runtime_for_members(p->settings, p->active_count);
+	relay_coord.cache_frames = relay_applied_settings.repair_floor < relay_applied_settings.max_repairs ? 5 : 3;
 	if (p->profile) {
 		uint32_t seed = relay_profile ? relay_timeline_active.frame + 1U : 0U;
 		relay_receiver_geometry = p->geometry;
@@ -858,7 +875,7 @@ static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
 		relay_frame_anchor = seed;
 		relay_start_anchor = relay_origin;
 		relay_timeline_clear(&relay_timeline_active);
-		relay_demand_reset(&relay_demand_state, seed, p->settings.repair_floor);
+		relay_demand_reset(&relay_demand_state, seed, relay_applied_settings.repair_floor);
 		relay_frame_announce(seed, relay_origin);
 	}
 	relay_applied_generation = p->settings_generation;
@@ -1014,12 +1031,13 @@ static void tdma_recalculate(bool forced)
 		}
 		struct relay_geometry geometry = relay_receiver_geometry;
 		if (profile) {
-			(void)relay_geometry_make(
+			(void)relay_geometry_make_b(
 				&geometry,
 				active_count,
-				relay_settings.max_repairs,
+				relay_runtime_for_members(relay_settings, active_count).max_repairs,
 				relay_settings.slot_ticks,
-				relay_settings.tps_max
+				relay_settings.tps_max,
+				relay_runtime_for_members(relay_settings, active_count).second_b
 			);
 		}
 		struct tdma_publication pub = {
@@ -5746,7 +5764,7 @@ void esb_relay_layout_print(void)
 	irq_unlock(key);
 	printk(
 		"relay layout: max_trackers=%u max_repairs=%u slot_ticks=%u tps_min=%u tps_max=%u "
-		"generation=%u applied=%u repair_floor=%u\n",
+		"generation=%u applied=%u repair_floor=%u second_b=%u\n",
 		desired.max_trackers,
 		desired.max_repairs,
 		desired.slot_ticks,
@@ -5754,18 +5772,20 @@ void esb_relay_layout_print(void)
 		desired.tps_max,
 		requested,
 		current,
-		desired.repair_floor
+		desired.repair_floor,
+		desired.second_b
 	);
 	printk(
 		"relay layout active: profile=%u direct=%u max_repairs=%u slot_ticks=%u tps_min=%u "
-		"tps_max=%u repair_floor=%u\n",
+		"tps_max=%u repair_floor=%u second_b=%u\n",
 		profile,
 		direct,
 		applied.max_repairs,
 		applied.slot_ticks,
 		applied.tps_min,
 		applied.tps_max,
-		applied.repair_floor
+		applied.repair_floor,
+		applied.second_b
 	);
 	printk(
 		"relay B plan: session=%u frame=%u direct=%u R=%u next_R=%u next2_R=%u slot_ticks=%u tps_max=%u\n",
@@ -5792,6 +5812,8 @@ int esb_relay_layout_set(const char *name, uint16_t value)
 		if (relay_settings.repair_floor == relay_settings.max_repairs || candidate.repair_floor > value) {
 			candidate.repair_floor = value;
 		}
+	} else if (!strcmp(name, "second_b") && value <= 2U) {
+		candidate.second_b = value;
 	} else if (!strcmp(name, "repair_floor") && value <= 5U) {
 		candidate.repair_floor = value;
 	} else if (!strcmp(name, "slot_ticks") && value <= 255U) {
@@ -5810,12 +5832,14 @@ int esb_relay_layout_set(const char *name, uint16_t value)
 	}
 	if (candidate.max_trackers == relay_settings.max_trackers && candidate.max_repairs == relay_settings.max_repairs
 		&& candidate.slot_ticks == relay_settings.slot_ticks && candidate.tps_min == relay_settings.tps_min
-		&& candidate.tps_max == relay_settings.tps_max && candidate.repair_floor == relay_settings.repair_floor) {
+		&& candidate.tps_max == relay_settings.tps_max && candidate.repair_floor == relay_settings.repair_floor
+		&& candidate.second_b == relay_settings.second_b) {
 		k_mutex_unlock(&tracker_store_lock);
 		esb_relay_layout_print();
 		return 0;
 	}
-	uint8_t record[10] = {2, candidate.max_trackers, candidate.max_repairs, candidate.slot_ticks};
+	uint8_t record[10]
+		= {3, candidate.max_trackers, candidate.max_repairs, candidate.slot_ticks | (candidate.second_b << 6)};
 	relay_put_be16(record + 4, candidate.tps_min);
 	relay_put_be16(record + 6, candidate.tps_max);
 	record[8] = candidate.repair_floor;
@@ -6000,6 +6024,7 @@ struct relay_broadcast_work {
 	uint32_t start_event;
 	volatile int result;
 	uint32_t freeze_rtc;
+	uint32_t generation;
 };
 
 /* Keep the five-age work out of the static encoder's register lifetime. */
@@ -6065,6 +6090,88 @@ failed:
 	return err;
 }
 
+/* Construct the second immutable copy before its launch freeze. */
+__attribute__((noipa, optimize("O3"))) static __ramfunc void
+relay_repeat_encode(uint8_t *out, const uint8_t *first, uint32_t preamble)
+{
+	static const uint8_t delta[4][256] = {
+		{0,   248, 247, 15,  233, 17,  30,  230, 213, 45,  34,  218, 60,  196, 203, 51,  173, 85,  90,  162, 68,  188,
+		 179, 75,  120, 128, 143, 119, 145, 105, 102, 158, 93,  165, 170, 82,  180, 76,  67,  187, 136, 112, 127, 135,
+		 97,  153, 150, 110, 240, 8,   7,   255, 25,  225, 238, 22,  37,  221, 210, 42,  204, 52,  59,  195, 186, 66,
+		 77,  181, 83,  171, 164, 92,  111, 151, 152, 96,  134, 126, 113, 137, 23,  239, 224, 24,  254, 6,   9,   241,
+		 194, 58,  53,  205, 43,  211, 220, 36,  231, 31,  16,  232, 14,  246, 249, 1,   50,  202, 197, 61,  219, 35,
+		 44,  212, 74,  178, 189, 69,  163, 91,  84,  172, 159, 103, 104, 144, 118, 142, 129, 121, 115, 139, 132, 124,
+		 154, 98,  109, 149, 166, 94,  81,  169, 79,  183, 184, 64,  222, 38,  41,  209, 55,  207, 192, 56,  11,  243,
+		 252, 4,   226, 26,  21,  237, 46,  214, 217, 33,  199, 63,  48,  200, 251, 3,   12,  244, 18,  234, 229, 29,
+		 131, 123, 116, 140, 106, 146, 157, 101, 86,  174, 161, 89,  191, 71,  72,  176, 201, 49,  62,  198, 32,  216,
+		 215, 47,  28,  228, 235, 19,  245, 13,  2,   250, 100, 156, 147, 107, 141, 117, 122, 130, 177, 73,  70,  190,
+		 88,  160, 175, 87,  148, 108, 99,  155, 125, 133, 138, 114, 65,  185, 182, 78,  168, 80,  95,  167, 57,  193,
+		 206, 54,  208, 40,  39,  223, 236, 20,  27,  227, 5,   253, 242, 10},
+		{0,   73,  146, 219, 35,  106, 177, 248, 70,  15,  212, 157, 101, 44,  247, 190, 140, 197, 30,  87,  175, 230,
+		 61,  116, 202, 131, 88,  17,  233, 160, 123, 50,  31,  86,  141, 196, 60,  117, 174, 231, 89,  16,  203, 130,
+		 122, 51,  232, 161, 147, 218, 1,   72,  176, 249, 34,  107, 213, 156, 71,  14,  246, 191, 100, 45,  62,  119,
+		 172, 229, 29,  84,  143, 198, 120, 49,  234, 163, 91,  18,  201, 128, 178, 251, 32,  105, 145, 216, 3,   74,
+		 244, 189, 102, 47,  215, 158, 69,  12,  33,  104, 179, 250, 2,   75,  144, 217, 103, 46,  245, 188, 68,  13,
+		 214, 159, 173, 228, 63,  118, 142, 199, 28,  85,  235, 162, 121, 48,  200, 129, 90,  19,  124, 53,  238, 167,
+		 95,  22,  205, 132, 58,  115, 168, 225, 25,  80,  139, 194, 240, 185, 98,  43,  211, 154, 65,  8,   182, 255,
+		 36,  109, 149, 220, 7,   78,  99,  42,  241, 184, 64,  9,   210, 155, 37,  108, 183, 254, 6,   79,  148, 221,
+		 239, 166, 125, 52,  204, 133, 94,  23,  169, 224, 59,  114, 138, 195, 24,  81,  66,  11,  208, 153, 97,  40,
+		 243, 186, 4,   77,  150, 223, 39,  110, 181, 252, 206, 135, 92,  21,  237, 164, 127, 54,  136, 193, 26,  83,
+		 171, 226, 57,  112, 93,  20,  207, 134, 126, 55,  236, 165, 27,  82,  137, 192, 56,  113, 170, 227, 209, 152,
+		 67,  10,  242, 187, 96,  41,  151, 222, 5,   76,  180, 253, 38,  111},
+		{0,   193, 133, 68,  13,  204, 136, 73,  26,  219, 159, 94,  23,  214, 146, 83,  52,  245, 177, 112, 57,  248,
+		 188, 125, 46,  239, 171, 106, 35,  226, 166, 103, 104, 169, 237, 44,  101, 164, 224, 33,  114, 179, 247, 54,
+		 127, 190, 250, 59,  92,  157, 217, 24,  81,  144, 212, 21,  70,  135, 195, 2,   75,  138, 206, 15,  208, 17,
+		 85,  148, 221, 28,  88,  153, 202, 11,  79,  142, 199, 6,   66,  131, 228, 37,  97,  160, 233, 40,  108, 173,
+		 254, 63,  123, 186, 243, 50,  118, 183, 184, 121, 61,  252, 181, 116, 48,  241, 162, 99,  39,  230, 175, 110,
+		 42,  235, 140, 77,  9,   200, 129, 64,  4,   197, 150, 87,  19,  210, 155, 90,  30,  223, 167, 102, 34,  227,
+		 170, 107, 47,  238, 189, 124, 56,  249, 176, 113, 53,  244, 147, 82,  22,  215, 158, 95,  27,  218, 137, 72,
+		 12,  205, 132, 69,  1,   192, 207, 14,  74,  139, 194, 3,   71,  134, 213, 20,  80,  145, 216, 25,  93,  156,
+		 251, 58,  126, 191, 246, 55,  115, 178, 225, 32,  100, 165, 236, 45,  105, 168, 119, 182, 242, 51,  122, 187,
+		 255, 62,  109, 172, 232, 41,  96,  161, 229, 36,  67,  130, 198, 7,   78,  143, 203, 10,  89,  152, 220, 29,
+		 84,  149, 209, 16,  31,  222, 154, 91,  18,  211, 151, 86,  5,   196, 128, 65,  8,   201, 141, 76,  43,  234,
+		 174, 111, 38,  231, 163, 98,  49,  240, 180, 117, 60,  253, 185, 120},
+		{0,   152, 55,  175, 110, 246, 89,  193, 220, 68,  235, 115, 178, 42,  133, 29,  191, 39,  136, 16,  209, 73,
+		 230, 126, 99,  251, 84,  204, 13,  149, 58,  162, 121, 225, 78,  214, 23,  143, 32,  184, 165, 61,  146, 10,
+		 203, 83,  252, 100, 198, 94,  241, 105, 168, 48,  159, 7,   26,  130, 45,  181, 116, 236, 67,  219, 242, 106,
+		 197, 93,  156, 4,   171, 51,  46,  182, 25,  129, 64,  216, 119, 239, 77,  213, 122, 226, 35,  187, 20,  140,
+		 145, 9,   166, 62,  255, 103, 200, 80,  139, 19,  188, 36,  229, 125, 210, 74,  87,  207, 96,  248, 57,  161,
+		 14,  150, 52,  172, 3,   155, 90,  194, 109, 245, 232, 112, 223, 71,  134, 30,  177, 41,  227, 123, 212, 76,
+		 141, 21,  186, 34,  63,  167, 8,   144, 81,  201, 102, 254, 92,  196, 107, 243, 50,  170, 5,   157, 128, 24,
+		 183, 47,  238, 118, 217, 65,  154, 2,   173, 53,  244, 108, 195, 91,  70,  222, 113, 233, 40,  176, 31,  135,
+		 37,  189, 18,  138, 75,  211, 124, 228, 249, 97,  206, 86,  151, 15,  160, 56,  17,  137, 38,  190, 127, 231,
+		 72,  208, 205, 85,  250, 98,  163, 59,  148, 12,  174, 54,  153, 1,   192, 88,  247, 111, 114, 234, 69,  221,
+		 28,  132, 43,  179, 104, 240, 95,  199, 6,   158, 49,  169, 180, 44,  131, 27,  218, 66,  237, 117, 215, 79,
+		 224, 120, 185, 33,  142, 22,  11,  147, 60,  164, 101, 253, 82,  202}
+	};
+	uint8_t v = first[71] ^ 69;
+	for (unsigned i = 0; i < 4; i++) {
+		v ^= delta[i][first[12 + i] ^ (uint8_t)(preamble >> (24U - 8U * i))];
+	}
+	memcpy(out, first, RELAY_CONTROL_LEN);
+	out[0] = RELAY_CONTROL_REPEAT;
+	relay_put_be32(out + 12, preamble);
+	out[71] = v;
+}
+
+__attribute__((noipa, optimize("O3"))) static __ramfunc int relay_repeat_arm(uint32_t event, uint32_t generation)
+{
+	if (generation != relay_layout_generation) {
+		return -ESTALE;
+	}
+	if (!atomic_cas(&radio_operation_busy, 0, 1)) {
+		return -EBUSY;
+	}
+	int err = esb_prx_broadcast_begin();
+	if (!err) {
+		err = esb_prx_broadcast_arm_event(k_ticks_to_us_floor32(RELAY_V3_TX_OFFSET) - 40U, event);
+	}
+	if (err) {
+		atomic_set(&radio_operation_busy, 0);
+	}
+	return err;
+}
+
 K_SEM_DEFINE(relay_freeze_done, 0, 1);
 
 static void relay_freeze_callback(int32_t channel, uint64_t expires, void *context)
@@ -6104,6 +6211,25 @@ static void relay_freeze_callback(int32_t channel, uint64_t expires, void *conte
 
 /* Copy each mutable row/history atomically, then plan with IRQs enabled.
  * Freeze rechecks current receipts; publication rejects a changed network. */
+static void relay_repeat_callback(int32_t channel, uint64_t expires, void *context)
+{
+	ARG_UNUSED(channel);
+	ARG_UNUSED(expires);
+	struct relay_broadcast_work *w = context;
+	unsigned polls = 65536;
+	while ((int32_t)((NRF_RTC1->COUNTER - w->freeze_rtc) << 8) < 0) {
+		if (!--polls) {
+			w->result = -ETIMEDOUT;
+			k_sem_give(&relay_freeze_done);
+			return;
+		}
+	}
+	unsigned key = irq_lock();
+	w->result = relay_repeat_arm(w->start_event, w->generation);
+	irq_unlock(key);
+	k_sem_give(&relay_freeze_done);
+}
+
 static bool relay_broadcast_context_current(const struct relay_control *control, uint32_t origin);
 static void relay_broadcast_plan(struct relay_control *control, struct rc_grant_plan *plan, struct esb_payload *payload)
 {
@@ -6219,6 +6345,7 @@ static void relay_broadcast_thread(void)
 			.tps_max = relay_geometry_current()->tps,
 			.epoch = relay_epoch,
 			.repair_count = relay_frame_repairs(frame),
+			.second_b = relay_applied_settings.second_b,
 			.on_demand = relay_applied_settings.repair_floor < relay_applied_settings.max_repairs,
 			.session = relay_session,
 			.frame = frame,
@@ -6251,8 +6378,13 @@ static void relay_broadcast_thread(void)
 		relay_coord.learn_members = control.members;
 		uint8_t *wire = esb_prx_broadcast_prepare(&payload);
 		struct relay_broadcast_work work = {
-			.control = &control, .plan = &plan, .wire = wire,
-			.crc = crc_plan, .start_event = launch_event, .result = -ETIMEDOUT,
+			.control = &control,
+			.plan = &plan,
+			.wire = wire,
+			.crc = crc_plan,
+			.start_event = launch_event,
+			.result = -ETIMEDOUT,
+			.generation = relay_layout_generation,
 		};
 		relay_b_plan_max = MAX(relay_b_plan_max, (uint32_t)k_uptime_ticks() - t_plan);
 		uint32_t launch_tick = preamble - RELAY_V3_TX_OFFSET;
@@ -6281,6 +6413,41 @@ static void relay_broadcast_thread(void)
 		if (!err) {
 			err = esb_prx_broadcast_wait(k_ticks_to_us_ceil32(RELAY_V3_B_PREP_LEAD_TICKS));
 			atomic_set(&radio_operation_busy, 0);
+		}
+		/* Re-encode only the timestamp/type/CRC outside the frozen path. The
+		 * grants and current/next/next2 plan are the first copy's immutable bytes. */
+		if (!err && control.second_b) {
+			uint32_t repeat = preamble
+							+ relay_second_b_offset(
+								  control.direct_count,
+								  control.repair_count,
+								  control.slot_ticks,
+								  control.second_b
+							);
+			relay_repeat_encode(payload.data, work.wire, repeat);
+			key = irq_lock();
+			bool current = relay_broadcast_context_current(&control, origin);
+			wire = current ? esb_prx_broadcast_prepare(&payload) : NULL;
+			uint64_t ticks = k_uptime_ticks();
+			uint64_t repeat_rtc = z_nrf_rtc_timer_get_ticks(
+				K_TIMEOUT_ABS_TICKS(ticks + (int32_t)(repeat - RELAY_V3_TX_OFFSET - (uint32_t)ticks))
+			);
+			work.freeze_rtc = (uint32_t)(repeat_rtc - 1U);
+			work.result = -ETIMEDOUT;
+			int schedule = !wire ? -ESTALE : z_nrf_rtc_timer_exact_set(rtc_channel, repeat_rtc, NULL, NULL);
+			if (!schedule) {
+				schedule = z_nrf_rtc_timer_exact_set(freeze_channel, repeat_rtc - 3U, relay_repeat_callback, &work);
+			}
+			irq_unlock(key);
+			if (!schedule) {
+				k_sem_take(&relay_freeze_done, K_FOREVER);
+				schedule = work.result;
+				if (!schedule) {
+					schedule = esb_prx_broadcast_wait(k_ticks_to_us_ceil32(RELAY_V3_B_PREP_LEAD_TICKS));
+					atomic_set(&radio_operation_busy, 0);
+				}
+			}
+			relay_b_err = schedule;
 		}
 #ifdef CONFIG_RELAY_FRAME_LEDGER
 		if (!err) {

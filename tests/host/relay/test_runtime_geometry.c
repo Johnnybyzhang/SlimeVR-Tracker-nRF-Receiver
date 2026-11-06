@@ -4,10 +4,10 @@
 
 int main(void)
 {
-	struct relay_runtime_settings s = {16, 1, 16, 100, 120, 0};
+	struct relay_runtime_settings s = {16, 1, 16, 100, 120, 0, 0};
 	assert(relay_runtime_validate(&s, false));
 	s.max_repairs = 5;
-	assert(relay_runtime_validate(&s, false) && s.max_repairs == 3);
+	assert(relay_runtime_validate(&s, false) && s.max_repairs == 5);
 	s.max_trackers = 11;
 	s.max_repairs = 5;
 	assert(relay_runtime_validate(&s, false) && s.max_repairs == 5);
@@ -16,8 +16,8 @@ int main(void)
 	assert(relay_runtime_validate(&s, true));
 	s.slot_ticks = 14;
 	assert(!relay_runtime_validate(&s, true));
-	s = (struct relay_runtime_settings){16, 1, 16, 120, 120, 0};
-	assert(!relay_runtime_validate(&s, false));
+	s = (struct relay_runtime_settings){16, 1, 16, 120, 120, 0, 0};
+	assert(relay_runtime_validate(&s, false));
 	for (unsigned direct = 1; direct <= 16; direct++) {
 		for (unsigned r = 0; r <= 5; r++) {
 			uint32_t total = 0;

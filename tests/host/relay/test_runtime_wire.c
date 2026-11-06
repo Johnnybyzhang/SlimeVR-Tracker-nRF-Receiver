@@ -2,7 +2,7 @@
 #include <assert.h>
 #include <stdio.h>
 #include "relay_protocol.h"
-static struct relay_geometry geometry = {16, 1, 16, 120, 288, 1};
+static struct relay_geometry geometry = {16, 1, 16, 120, 288, 1, 0};
 const struct relay_geometry *relay_geometry_active = &geometry;
 struct relay_timeline relay_timeline_active;
 struct relay_runtime_anchor relay_direct_anchor;
@@ -136,5 +136,5 @@ int main(void)
 		assert(!relay_runtime_direct_granted(&relay_direct_anchor, relay_direct_anchor.third_start + 256U));
 		start += relay_runtime_period(frame, 16, repairs, 16, 120);
 	}
-	puts("Wire v4 runtime geometry, every current/next/next2 R, frozen CRC, descriptors and timeline passed");
+	puts("Wire v6 runtime geometry, every current/next/next2 R, frozen CRC, descriptors and timeline passed");
 }

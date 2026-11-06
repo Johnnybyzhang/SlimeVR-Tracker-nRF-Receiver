@@ -6,7 +6,7 @@
 
 static void policy(void)
 {
-	struct relay_runtime_settings s = {11, 5, 16, 100, 120, 0};
+	struct relay_runtime_settings s = {11, 5, 16, 100, 120, 0, 0};
 	struct relay_demand d;
 	relay_demand_reset(&d, 100, 0);
 	uint8_t current = d.queued[0], next = d.queued[1];
@@ -31,13 +31,14 @@ static void policy(void)
 		assert(d.queued[2] == ((f + 2) % 8 == 0 ? 2 : 0));
 	}
 	s.max_trackers = 16;
-	assert(relay_runtime_validate(&s, false) && s.max_repairs == 3);
+	assert(relay_runtime_validate(&s, false) && s.max_repairs == 5);
+	s = relay_runtime_for_members(s, 16);
 	relay_demand_update(&d, 320, 16, &s);
 	assert(d.target == 3);
-	s.repair_floor = 4;
+	s.repair_floor = 6;
 	assert(!relay_runtime_validate(&s, false));
 	for (unsigned f = 321; f < 500; f++) {
-		relay_demand_update(&d, f, 16, &(struct relay_runtime_settings){16, 3, 16, 100, 120, 1});
+		relay_demand_update(&d, f, 16, &(struct relay_runtime_settings){16, 3, 16, 100, 120, 1, 0});
 		for (unsigned k = 0; k < 3; k++) {
 			assert(relay_runtime_period(f + k, 16, d.queued[k], 16, 120) <= 32768 / 100);
 		}
@@ -100,7 +101,7 @@ static void wire(void)
 			assert(!relay_control_decode(buf, 72, &decoded));
 		}
 	}
-	puts("PASS demand: v4 five-mask roundtrip and frozen CRC, all R and maintenance owners");
+	puts("PASS demand: v7 five-mask roundtrip and frozen CRC, all R and maintenance owners");
 }
 
 static void late_direct(void)
@@ -216,7 +217,8 @@ static void simulate(unsigned members, unsigned mode, unsigned trace, unsigned f
 		   mode < 2    ? mode
 		   : mode == 2 ? 1
 		   : mode == 3 ? 3
-					   : 5};
+					   : 5,
+		   0};
 	assert(relay_runtime_validate(&settings, false));
 	if (mode >= 2) {
 		settings.max_repairs = settings.repair_floor;

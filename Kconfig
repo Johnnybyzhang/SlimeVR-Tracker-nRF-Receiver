@@ -200,7 +200,7 @@ config RELAY_RUNTIME_LAYOUT
 config RELAY_MAX_TRACKERS
     int "Maximum private relay members"
     range 1 16
-    default 11
+    default 16
 
 config RELAY_MAX_REPAIRS
     int "Maximum ordinary repair slots"
@@ -226,9 +226,9 @@ config RELAY_SLOT_TICKS
     default 16
 
 config RELAY_TPS_MIN
-    int "Guaranteed private relay TPS floor"
+    int "TPS target held by shrinking repair slots"
     range 1 32768
-    default 100
+    default 120
 
 config RELAY_TPS_MAX
     int "Private relay TPS cap"

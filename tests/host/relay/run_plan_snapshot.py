@@ -13,7 +13,7 @@ code=r'''
 #include "relay_coord.h"
 struct esb_payload {uint8_t data[72];};
 static struct relay_coord relay_coord;
-static struct relay_runtime_settings relay_applied_settings={16,RELAY_V3_REPAIR_SLOTS,16,100,120,RELAY_V3_REPAIR_SLOTS};
+static struct relay_runtime_settings relay_applied_settings={16,RELAY_V3_REPAIR_SLOTS,16,100,120,RELAY_V3_REPAIR_SLOTS,0};
 static bool esb_initialized=true,esb_pairing,locked;
 static uint8_t relay_profile=1,relay_epoch=2;
 static uint16_t tdma_active_mask=0x7ff;

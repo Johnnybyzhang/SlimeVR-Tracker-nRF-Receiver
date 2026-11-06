@@ -645,6 +645,49 @@ static void runtime_settings_publication(void)
 	assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame, &start));
 	assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame + 1, &next));
 	assert(next - start == 320 && relay_applied_settings.max_repairs == 3);
+	/* Exercise actual publication across every threshold in both directions.
+	 * The old applied queue stays intact while the next publication is staged. */
+	for (unsigned target = 100; target <= 120; target += 20) {
+		for (unsigned pass = 0; pass < 2; pass++) {
+			for (unsigned i = 1; i <= 16; i++) {
+				unsigned n = pass ? 17 - i : i;
+				struct relay_runtime_settings desired = {16, 5, 16, target, 120, 5, 0};
+				struct relay_runtime_settings effective = relay_runtime_for_members(desired, n);
+				struct tdma_publication pending
+					= {.new_mask = (1U << n) - 1U,
+					   .active_count = n,
+					   .profile = 1,
+					   .slot_ticks = 16,
+					   .epoch = (uint8_t)(relay_epoch + 1),
+					   .settings = desired,
+					   .settings_generation = ++relay_settings_generation};
+				assert(relay_geometry_make_b(&pending.geometry, n, effective.max_repairs, 16, 120, 0));
+				tdma_staged.p = pending;
+				tdma_staged.valid = true;
+				unsigned previous = relay_applied_settings.max_repairs;
+				assert(tdma_staged.p.settings.max_repairs == 5 && relay_applied_settings.max_repairs == previous);
+				tdma_staged.activation_ticks = ticks_at(now_ms) + 1000;
+				key = irq_lock();
+				tdma_apply_locked(&tdma_staged.p, now_ms);
+				irq_unlock(key);
+				assert(relay_applied_settings.max_repairs == effective.max_repairs);
+				assert(relay_applied_settings.repair_floor == effective.max_repairs);
+				assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame, &start));
+				assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame + 1, &next));
+				assert(
+					next - start
+					== relay_runtime_period(
+						relay_timeline_active.frame,
+						n,
+						relay_frame_repairs(relay_timeline_active.frame),
+						16,
+						120
+					)
+				);
+				tdma_staged.valid = false;
+			}
+		}
+	}
 	puts("PASS runtime settings activation: ranked member cap, immutable pending settings and monotonic frame epochs");
 }
 

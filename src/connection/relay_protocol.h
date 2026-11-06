@@ -139,6 +139,7 @@
 
 #define RELAY_V3_VERSION 4U
 #define RELAY_CONTROL_V3 0xE8U
+#define RELAY_CONTROL_REPEAT 0xECU
 #define RELAY_REPAIR_V3 0xE9U
 #define RELAY_PEER_REPORT_V3 0xEAU
 #define RELAY_LAYOUT_V3 0xEBU
@@ -156,40 +157,45 @@
 struct relay_geometry {
 	uint8_t direct, repairs, slot_ticks;
 	uint16_t tps, numerator, denominator;
+	uint8_t second_b;
 };
 /* Receiver settings describe capacity. Frame geometry uses present members. */
 struct relay_runtime_settings {
 	uint8_t max_trackers, max_repairs, slot_ticks;
 	uint16_t tps_min, tps_max;
 	uint8_t repair_floor;
+	uint8_t second_b;
 };
 
-/* Clamp only repair capacity. Reject settings that cannot even provide the
- * two-attempt maintenance exchange at the guaranteed floor. */
+/* Targets guide the repair budget; minimum R and maintenance take priority. */
 static inline bool relay_runtime_validate(struct relay_runtime_settings *settings, bool experimental)
 {
-	struct relay_runtime_settings s = *settings;
-	if (!s.max_trackers || s.max_trackers > RELAY_MAX_TRACKERS || s.max_repairs > 5U || s.repair_floor > s.max_repairs
-		|| (s.slot_ticks != 16U && !(experimental && s.slot_ticks == 15U)) || !s.tps_min || s.tps_min > s.tps_max
-		|| s.tps_max > 32768U) {
-		return false;
-	}
+	const struct relay_runtime_settings *s = settings;
+	return s->max_trackers && s->max_trackers <= RELAY_MAX_TRACKERS && s->second_b <= 2U && s->max_repairs >= 1U
+		&& s->max_repairs <= 5U && s->repair_floor <= s->max_repairs
+		&& (s->slot_ticks == 16U || (experimental && s->slot_ticks == 15U)) && s->tps_min && s->tps_min <= s->tps_max
+		&& s->tps_max <= 32768U;
+}
+
+/* Compute once for the staged member set, never from the configured member cap. */
+static inline struct relay_runtime_settings relay_runtime_for_members(struct relay_runtime_settings s, uint8_t direct)
+{
 	unsigned slots = 32768U / s.tps_min / s.slot_ticks;
-	if (slots < s.max_trackers + 3U) {
-		return false;
+	unsigned repairs = slots > direct + 1U ? slots - direct - 1U : 1U;
+	if (repairs > s.max_repairs) {
+		repairs = s.max_repairs;
 	}
-	unsigned available = slots - s.max_trackers - 1U;
-	if (s.max_repairs > available) {
-		s.max_repairs = available;
-		if (s.repair_floor > available) {
-			s.repair_floor = available;
-		}
+	bool fixed = s.repair_floor == s.max_repairs;
+	s.second_b = repairs >= 3U ? s.second_b : 0U;
+	repairs -= s.second_b != 0;
+	s.max_repairs = repairs;
+	if (fixed || s.repair_floor > repairs) {
+		s.repair_floor = repairs;
 	}
-	if (s.repair_floor > s.max_repairs) {
-		return false;
+	if (s.second_b && s.repair_floor < 2U) {
+		s.repair_floor = 2U;
 	}
-	*settings = s;
-	return true;
+	return s;
 }
 
 /* The cap grid is rational and tied to frame number. Occupied time can
@@ -235,6 +241,24 @@ static inline void relay_runtime_anchor_set(
 	a->valid = true;
 }
 
+static inline void relay_runtime_anchor_second_b(
+	struct relay_runtime_anchor *a,
+	uint8_t repairs,
+	uint8_t next,
+	uint8_t next2,
+	uint16_t cap,
+	uint8_t mode
+)
+{
+	if (mode) {
+		a->next_start = a->start + relay_runtime_period(a->frame, a->direct, repairs + 1U, a->slot_ticks, cap);
+		a->following_start
+			= a->next_start + relay_runtime_period(a->frame + 1U, a->direct, next + 1U, a->slot_ticks, cap);
+		a->third_start
+			= a->following_start + relay_runtime_period(a->frame + 2U, a->direct, next2 + 1U, a->slot_ticks, cap);
+	}
+}
+
 static inline bool relay_runtime_start(const struct relay_runtime_anchor *a, uint32_t frame, uint32_t *start)
 {
 	if (!a->valid || (uint32_t)(frame - a->frame) > 3U) {
@@ -270,9 +294,37 @@ relay_geometry_make(struct relay_geometry *g, uint8_t direct, uint8_t repairs, u
 		slot_ticks,
 		cap,
 		occupied * cap >= 32768U ? occupied : 32768U / divisor,
-		occupied * cap >= 32768U ? 1U : cap / divisor
+		occupied * cap >= 32768U ? 1U : cap / divisor,
+		0
 	};
 	return true;
+}
+
+/* The extra B consumes the repair slot traded away by the staged policy. */
+static inline bool relay_geometry_make_b(
+	struct relay_geometry *g,
+	uint8_t direct,
+	uint8_t repairs,
+	uint8_t width,
+	uint16_t cap,
+	uint8_t second_b
+)
+{
+	if (second_b > 2U || (second_b && (repairs < 2U || repairs > 4U))) {
+		return false;
+	}
+	if (!relay_geometry_make(g, direct, repairs + (second_b != 0), width, cap)) {
+		return false;
+	}
+	g->repairs = repairs;
+	g->second_b = second_b;
+	return true;
+}
+
+static inline uint32_t relay_second_b_offset(uint8_t direct, uint8_t repairs, uint8_t width, uint8_t mode)
+{
+	(void)direct;
+	return mode == 1U ? width : mode == 2U ? (repairs + 1U) * width : 0U;
 }
 
 /* Private PONG geometry: bit7 private, bits6..3 direct-1, bits2..0 base R.
@@ -321,7 +373,8 @@ RELAY_LAYOUT_INLINE const struct relay_geometry *relay_geometry_current(void)
 		   RELAY_HOST_SLOT_TICKS,
 		   RELAY_HOST_TPS_MAX,
 		   RELAY_HOST_NUMERATOR,
-		   RELAY_HOST_DENOMINATOR};
+		   RELAY_HOST_DENOMINATOR,
+		   0};
 	return &fixture;
 }
 #endif
@@ -392,8 +445,9 @@ extern struct relay_runtime_anchor relay_direct_anchor;
 #define RELAY_V3_B_START (RELAY_V3_DIRECT_SLOTS * RELAY_V3_SLOT_TICKS)
 #define RELAY_V3_TX_OFFSET 2U /* preamble target inside a slot, as TDMA_SLOT_TARGET_OFFSET */
 #define RELAY_V3_B_PREAMBLE (RELAY_V3_B_START + RELAY_V3_TX_OFFSET)
-#define RELAY_V3_REPAIR_START (RELAY_V3_B_START + RELAY_V3_SLOT_TICKS)
-#define RELAY_V3_REPAIR_FIRST_SLOT (RELAY_V3_DIRECT_SLOTS + 1U)
+#define RELAY_V3_REPAIR_START                                                                                          \
+	(RELAY_V3_B_START + RELAY_V3_SLOT_TICKS * (1U + (relay_geometry_current()->second_b == 1U)))
+#define RELAY_V3_REPAIR_FIRST_SLOT (RELAY_V3_DIRECT_SLOTS + 1U + (relay_geometry_current()->second_b == 1U))
 #define RELAY_V3_CAPTURE_TAIL_TICKS 2U
 #define RELAY_V3_B_PREP_LEAD_TICKS 3U
 #define RELAY_REPAIR_HEADER_LEN 8U
@@ -753,6 +807,7 @@ struct relay_control {
 	uint8_t flags;
 	uint16_t missing_extra[2];
 	bool on_demand;
+	uint8_t second_b;
 };
 /* Keep the static control layout unchanged, including its hot-path offsets. */
 #define relay_control_missing(c, age) (*((unsigned)(age) < 3U ? &(c)->missing[(age)] : &(c)->missing_extra[(age) - 3U]))
@@ -883,15 +938,19 @@ static inline void relay_control_set_next2_repairs(struct relay_control *c, uint
 static inline bool relay_control_valid(const struct relay_control *c)
 {
 	struct relay_geometry g;
-	if (!relay_geometry_make(
+	if (!relay_geometry_make_b(
 			&g,
 			c->direct_count ? c->direct_count : relay_mask_count(c->members),
 			c->repair_count,
 			c->slot_ticks ? c->slot_ticks : RELAY_V3_SLOT_TICKS,
-			c->tps_max ? c->tps_max : relay_geometry_current()->tps
+			c->tps_max ? c->tps_max : relay_geometry_current()->tps,
+			c->second_b
 		)
 		|| !relay_geometry_valid(c->profile, c->members, c->expected, g.slot_ticks, c->repair_count, &g)
 		|| (c->direct_count && relay_mask_count(c->members) != c->direct_count)
+		|| (c->second_b
+			&& (relay_control_next_repairs(c) < 2U || relay_control_next2_repairs(c) < 2U
+				|| relay_control_next_repairs(c) > 4U || relay_control_next2_repairs(c) > 4U))
 		|| relay_control_next_repairs(c) > RELAY_V3_REPAIR_MAX || relay_control_next2_repairs(c) > RELAY_V3_REPAIR_MAX
 		|| (c->maintenance_owner >= RELAY_MAX_TRACKERS && c->maintenance_owner != RELAY_OWNER_IDLE)
 		|| ((c->primary_valid | c->backup_valid | c->survey) & ~c->members)) {
@@ -993,12 +1052,13 @@ static inline size_t relay_control_encode(uint8_t out[RELAY_CONTROL_LEN], const 
 	relay_put_be16(out + RELAY_CONTROL_OFF_WATCH, c->watch_generation);
 	out[RELAY_CONTROL_OFF_PROFILE] = c->profile;
 	out[RELAY_CONTROL_OFF_FLAGS] = c->flags;
-	out[68] = c->slot_ticks ? c->slot_ticks : RELAY_V3_SLOT_TICKS;
+	out[68] = (c->slot_ticks ? c->slot_ticks : RELAY_V3_SLOT_TICKS) | (c->second_b << 6);
 	relay_put_be16(out + 69, c->tps_max ? c->tps_max : relay_geometry_current()->tps);
 	if (c->on_demand) {
 		relay_put_be16(out + 63, relay_control_missing(c, 3));
 		relay_put_be16(out + 65, relay_control_missing(c, 4));
-		out[68] = (c->slot_ticks == 15U) | ((c->maintenance_owner < 16U ? c->maintenance_owner : 16U) << 1);
+		out[68] = (c->slot_ticks == 15U) | ((c->maintenance_owner < 16U ? c->maintenance_owner : 16U) << 1)
+				| (c->second_b << 6);
 	}
 	out[RELAY_CONTROL_OFF_CRC] = relay_crc8(7, out, 71);
 	return RELAY_CONTROL_LEN;
@@ -1018,7 +1078,7 @@ static inline struct relay_control_crc_plan relay_control_plan_crc(const uint8_t
 	tail = relay_crc8(tail, &zero, 1);
 	tail = relay_crc8(tail, out + 68, 3);
 	uint8_t watch = relay_crc8(0, out + 26, 20);
-	const uint8_t geometry[3] = {(out[68] & 1U) | 32U, out[69], out[70]};
+	const uint8_t geometry[3] = {(out[68] & 0xc1U) | 32U, out[69], out[70]};
 	if (!(out[3] & 0x80U)) {
 		const uint8_t zeros[25] = {0};
 		tail ^= relay_crc8(watch, zeros, sizeof(zeros));
@@ -1166,7 +1226,7 @@ static inline void relay_control_finish_encode(
 		relay_put_be16(out + 63, relay_control_missing(c, 3));
 		relay_put_be16(out + 65, relay_control_missing(c, 4));
 		unsigned owner = c->maintenance_owner < 16U ? c->maintenance_owner : 16U;
-		out[68] = (c->slot_ticks == 15U) | (owner << 1);
+		out[68] = (c->slot_ticks == 15U) | (owner << 1) | (c->second_b << 6);
 		uint8_t v = relay_crc8(crc.prefix, out + 20, 6);
 		v = shift20[v] ^ crc.watch;
 		v = relay_crc8(v, out + 46, 22);
@@ -1185,14 +1245,17 @@ static inline void relay_control_finish_encode(
 
 static inline bool relay_control_decode(const uint8_t *in, size_t length, struct relay_control *c)
 {
-	if (length != RELAY_CONTROL_LEN || in[RELAY_CONTROL_OFF_TYPE] != RELAY_CONTROL_V3
-		|| in[RELAY_CONTROL_OFF_VERSION] != RELAY_V3_VERSION || (!(in[3] & 0x80U) && in[68] != 15U && in[68] != 16U)
-		|| ((in[3] & 0x80U) && (in[68] >> 1) > 16U) || !relay_get_be16(in + 69) || relay_get_be16(in + 69) > 32768U
-		|| in[RELAY_CONTROL_OFF_CRC] != relay_crc8(7, in, 71)) {
+	if (length != RELAY_CONTROL_LEN
+		|| (in[RELAY_CONTROL_OFF_TYPE] != RELAY_CONTROL_V3 && in[RELAY_CONTROL_OFF_TYPE] != 0xecU)
+		|| in[RELAY_CONTROL_OFF_VERSION] != RELAY_V3_VERSION
+		|| (!(in[3] & 0x80U) && (in[68] & 63U) != 15U && (in[68] & 63U) != 16U)
+		|| ((in[3] & 0x80U) && ((in[68] & 63U) >> 1) > 16U) || !relay_get_be16(in + 69)
+		|| relay_get_be16(in + 69) > 32768U || in[RELAY_CONTROL_OFF_CRC] != relay_crc8(7, in, 71)) {
 		return false;
 	}
 	c->direct_count = ((in[3] >> 3) & 15U) + 1U;
-	c->slot_ticks = in[68];
+	c->slot_ticks = in[68] & 63U;
+	c->second_b = in[68] >> 6;
 	c->tps_max = relay_get_be16(in + 69);
 	c->epoch = in[RELAY_CONTROL_OFF_EPOCH];
 	c->repair_count = in[RELAY_CONTROL_OFF_REPAIR_COUNT] & 7U;
@@ -1217,6 +1280,17 @@ static inline bool relay_control_decode(const uint8_t *in, size_t length, struct
 	c->profile = in[RELAY_CONTROL_OFF_PROFILE];
 	c->flags = in[RELAY_CONTROL_OFF_FLAGS];
 	c->on_demand = (in[3] & 0x80U) != 0;
+	if (in[0] == 0xecU) {
+		if (!c->second_b) {
+			return false;
+		}
+		c->preamble_ticks -= relay_second_b_offset(
+			c->direct_count,
+			c->repair_count,
+			(in[3] & 0x80U) ? ((in[68] & 1U) ? 15U : 16U) : c->slot_ticks,
+			c->second_b
+		);
+	}
 	relay_control_missing(c, 3) = relay_control_missing(c, 4) = 0;
 	if (c->on_demand) {
 		relay_control_missing(c, 3) = relay_get_be16(in + 63);
@@ -1224,7 +1298,7 @@ static inline bool relay_control_decode(const uint8_t *in, size_t length, struct
 		c->slot_ticks = (in[68] & 1U) ? 15 : 16;
 		c->profile = RELAY_PROFILE_120HZ;
 		c->watch_generation = 0;
-		c->maintenance_owner = (in[68] >> 1) < 16U ? in[68] >> 1 : RELAY_OWNER_IDLE;
+		c->maintenance_owner = ((in[68] & 63U) >> 1) < 16U ? (in[68] & 63U) >> 1 : RELAY_OWNER_IDLE;
 	}
 
 	return relay_control_valid(c);
