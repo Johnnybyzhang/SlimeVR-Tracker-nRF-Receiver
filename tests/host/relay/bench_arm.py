@@ -240,7 +240,7 @@ int main(int argc, char **argv) {
     subprocess.run([os.environ.get('CC', 'cc'), '-O2', *fixture_flags, '-Wno-unknown-attributes', '-I', str(here), '-I', str(root / 'src/connection'), str(golden_c), str(root / 'src/connection/relay_coord.c'), '-o', str(golden_exe)], check=True)
     golden = subprocess.check_output([str(golden_exe), str(args.seeds)])
     maximum, worst_seed, worst_phases = 0, 0, {}
-    repeat_arm_max=repeat_encode_max=0
+    repeat_arm_max=repeat_encode_max=repeat_post_end_max=0
     arm_max, encode_max = 0, 0
     member_maxima = {}
     payload, work, event = 0x2003c000, 0x2003c100, 0x40011144
@@ -302,8 +302,17 @@ int main(int argc, char **argv) {
             # the actual repeat arm entry separately against the same ceilings.
             source = 0x2003c200
             u.mem_write(source, actual)
-            at = int.from_bytes(actual[12:16],'big') + ((args.repairs+1)*args.slot_ticks if args.second_b==2 else args.slot_ticks)
+            at = int.from_bytes(actual[12:16],'big') + ((args.repairs+1)*args.slot_ticks if args.second_b==2 else 2*args.slot_ticks)
+            # Execute the real copy-1 DISABLED/PRX restoration and wait-return,
+            # then encoding/preparation. No assumption that this work happens
+            # before the first packet END is allowed in the duplicate deadline.
+            call('on_radio_disabled_broadcast', measure=True)
+            post_end_cycles = cycles + 24
+            assert call('esb_prx_broadcast_wait', 92, measure=True) == 0
+            post_end_cycles += cycles + 24
+            write32(sym['radio_operation_busy.lto_priv.0'], 0)
             call('relay_repeat_encode', payload+5, source, at & 0xffffffff, measure=True)
+            post_end_cycles += cycles + 24
             repeat_encode_max=max(repeat_encode_max,cycles+24)
             repeat=bytes(u.mem_read(payload+5,72))
             assert repeat[0]==0xec and repeat[1:12]==actual[1:12] and repeat[16:71]==actual[16:71]
@@ -314,11 +323,17 @@ int main(int argc, char **argv) {
             assert repeat[71]==check
             # Model completion of copy 1's bounded PRX restoration, then
             # prepare copy 2 through the same linked SDK entry points.
-            u.mem_write(0x20000000,initial_ram)
-            u.mem_write(0x40000000,initial_peripherals)
             disable_ready=None
             u.mem_write(payload,bytes([72,1,0,1,0])+repeat)
-            assert call('esb_prx_broadcast_prepare',payload)
+            assert call('esb_prx_broadcast_prepare',payload,measure=True)
+            post_end_cycles += cycles + 24
+            # Keep a separate 128us allowance for IRQ/thread dispatch and RTC
+            # exact_set callers. This is pipeline slack, not an arm/encode limit.
+            post_end_cycles += 8192
+            callback_ticks = ((args.repairs+1)*args.slot_ticks if args.second_b==2 else 2*args.slot_ticks)-2-3
+            slack_cycles = (callback_ticks-11)*64000000//32768
+            repeat_post_end_max=max(repeat_post_end_max,post_end_cycles)
+            assert post_end_cycles < slack_cycles, (seed,'B2 callback already due',post_end_cycles,slack_cycles)
             generation=read32(sym['relay_layout_generation.lto_priv.0'])
             assert call('relay_repeat_arm',event,generation+1) & 0x80000000
             assert read32(sym['radio_operation_busy.lto_priv.0'])==0
@@ -326,6 +341,7 @@ int main(int argc, char **argv) {
             repeat_arm_max=max(repeat_arm_max,cycles+24)
     if args.second_b:
         print('second B arm/encode:',repeat_arm_max,repeat_encode_max)
+        print('B1 END to prepared B2, including 128us dispatch/caller allowance:',repeat_post_end_max,'cycles; callback slack',slack_cycles,'cycles')
         assert repeat_arm_max<=1130 and repeat_encode_max<=805
     # Failures must not steal another owner's radio, or leak our ownership.
     for failure in ('stale', 'busy', 'not_prx', 'late', 'reinit', 'disabled_stuck', 'disabled_late'):

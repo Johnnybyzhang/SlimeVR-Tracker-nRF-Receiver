@@ -753,6 +753,8 @@ static uint32_t irq_probe_tick_max, irq_probe_tick_count;
 #define IRQ_PROBE_END(name)
 #endif
 
+static uint32_t relay_b2_sent, relay_b2_failed;
+static int relay_b2_err;
 static uint32_t relay_b_sent, relay_b_failed;
 /* B timing, ticks: launch past preamble - TX_OFFSET (count, max), plan and grant work (max). */
 static uint32_t relay_b_late, relay_b_late_max, relay_b_plan_max, relay_b_grant_max;
@@ -5895,6 +5897,7 @@ void esb_relay_print_status(void)
 		snapshot.assignments, snapshot.rotations, snapshot.releases);
 	printk("relay: profile=%u B_sent=%u B_failed=%u last_err=%d\n", relay_profile, relay_b_sent,
 		relay_b_failed, relay_b_err);
+	printk("relay: B2_sent=%u B2_failed=%u last_err=%d\n", relay_b2_sent, relay_b2_failed, relay_b2_err);
 	printk("relay: B late=%u late_max=%u plan_max=%u grant_max=%u ticks\n", relay_b_late,
 		relay_b_late_max, relay_b_plan_max, relay_b_grant_max);
 	printk("relay: learning irq_max=%u ticks\n", relay_learn_lock_max);
@@ -6447,6 +6450,9 @@ static void relay_broadcast_thread(void)
 					atomic_set(&radio_operation_busy, 0);
 				}
 			}
+			relay_b2_sent += schedule == 0;
+			relay_b2_failed += schedule != 0;
+			relay_b2_err = schedule;
 			relay_b_err = schedule;
 		}
 #ifdef CONFIG_RELAY_FRAME_LEDGER

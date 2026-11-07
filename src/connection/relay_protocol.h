@@ -177,17 +177,31 @@ static inline bool relay_runtime_validate(struct relay_runtime_settings *setting
 		&& s->tps_max <= 32768U;
 }
 
+/* Adjacent B2 has one full vacant slot after B1 for PRX restoration and
+ * repeat preparation. Tail B2 needs only its own occupied slot. */
+static inline unsigned relay_second_b_slots(unsigned mode)
+{
+	return mode == 1U ? 2U : mode == 2U ? 1U : 0U;
+}
+
 /* Compute once for the staged member set, never from the configured member cap. */
 static inline struct relay_runtime_settings relay_runtime_for_members(struct relay_runtime_settings s, uint8_t direct)
 {
 	unsigned slots = 32768U / s.tps_min / s.slot_ticks;
-	unsigned repairs = slots > direct + 1U ? slots - direct - 1U : 1U;
+	unsigned budget = slots > direct + 1U ? slots - direct - 1U : 1U;
+	unsigned repairs = budget;
 	if (repairs > s.max_repairs) {
 		repairs = s.max_repairs;
 	}
 	bool fixed = s.repair_floor == s.max_repairs;
-	s.second_b = repairs >= 3U ? s.second_b : 0U;
-	repairs -= s.second_b != 0;
+	s.second_b = repairs >= 3U && (s.second_b != 1U || budget >= 4U) ? s.second_b : 0U;
+	if (s.second_b) {
+		repairs--;
+		unsigned available = budget - relay_second_b_slots(s.second_b);
+		if (repairs > available) {
+			repairs = available;
+		}
+	}
 	s.max_repairs = repairs;
 	if (fixed || s.repair_floor > repairs) {
 		s.repair_floor = repairs;
@@ -251,11 +265,15 @@ static inline void relay_runtime_anchor_second_b(
 )
 {
 	if (mode) {
-		a->next_start = a->start + relay_runtime_period(a->frame, a->direct, repairs + 1U, a->slot_ticks, cap);
+		a->next_start
+			= a->start
+			+ relay_runtime_period(a->frame, a->direct, repairs + relay_second_b_slots(mode), a->slot_ticks, cap);
 		a->following_start
-			= a->next_start + relay_runtime_period(a->frame + 1U, a->direct, next + 1U, a->slot_ticks, cap);
+			= a->next_start
+			+ relay_runtime_period(a->frame + 1U, a->direct, next + relay_second_b_slots(mode), a->slot_ticks, cap);
 		a->third_start
-			= a->following_start + relay_runtime_period(a->frame + 2U, a->direct, next2 + 1U, a->slot_ticks, cap);
+			= a->following_start
+			+ relay_runtime_period(a->frame + 2U, a->direct, next2 + relay_second_b_slots(mode), a->slot_ticks, cap);
 	}
 }
 
@@ -313,10 +331,14 @@ static inline bool relay_geometry_make_b(
 	if (second_b > 2U || (second_b && (repairs < 2U || repairs > 4U))) {
 		return false;
 	}
-	if (!relay_geometry_make(g, direct, repairs + (second_b != 0), width, cap)) {
+	if (!relay_geometry_make(g, direct, repairs, width, cap)) {
 		return false;
 	}
-	g->repairs = repairs;
+	unsigned occupied = (direct + 1U + repairs + relay_second_b_slots(second_b)) * width;
+	if (occupied * cap >= 32768U) {
+		g->numerator = occupied;
+		g->denominator = 1;
+	}
 	g->second_b = second_b;
 	return true;
 }
@@ -324,7 +346,7 @@ static inline bool relay_geometry_make_b(
 static inline uint32_t relay_second_b_offset(uint8_t direct, uint8_t repairs, uint8_t width, uint8_t mode)
 {
 	(void)direct;
-	return mode == 1U ? width : mode == 2U ? (repairs + 1U) * width : 0U;
+	return mode == 1U ? 2U * width : mode == 2U ? (repairs + 1U) * width : 0U;
 }
 
 /* Private PONG geometry: bit7 private, bits6..3 direct-1, bits2..0 base R.
@@ -446,8 +468,8 @@ extern struct relay_runtime_anchor relay_direct_anchor;
 #define RELAY_V3_TX_OFFSET 2U /* preamble target inside a slot, as TDMA_SLOT_TARGET_OFFSET */
 #define RELAY_V3_B_PREAMBLE (RELAY_V3_B_START + RELAY_V3_TX_OFFSET)
 #define RELAY_V3_REPAIR_START                                                                                          \
-	(RELAY_V3_B_START + RELAY_V3_SLOT_TICKS * (1U + (relay_geometry_current()->second_b == 1U)))
-#define RELAY_V3_REPAIR_FIRST_SLOT (RELAY_V3_DIRECT_SLOTS + 1U + (relay_geometry_current()->second_b == 1U))
+	(RELAY_V3_B_START + RELAY_V3_SLOT_TICKS * (1U + (2U * (relay_geometry_current()->second_b == 1U))))
+#define RELAY_V3_REPAIR_FIRST_SLOT (RELAY_V3_DIRECT_SLOTS + 1U + (2U * (relay_geometry_current()->second_b == 1U)))
 #define RELAY_V3_CAPTURE_TAIL_TICKS 2U
 #define RELAY_V3_B_PREP_LEAD_TICKS 3U
 #define RELAY_REPAIR_HEADER_LEN 8U
