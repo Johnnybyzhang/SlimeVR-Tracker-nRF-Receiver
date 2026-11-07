@@ -1263,7 +1263,17 @@ static inline __attribute__((always_inline)) uint16_t rc_take_records(uint32_t *
 {
 	uint32_t records = *pending & candidates;
 	uint32_t rest = records;
-	while (rest && *capacity) {
+	/* All callers start with at most three records. Spell out that bound
+	 * so the frozen encoder pays no loop-back branch for each record. */
+	if (rest && *capacity) {
+		rest &= rest - 1U;
+		(*capacity)--;
+	}
+	if (rest && *capacity) {
+		rest &= rest - 1U;
+		(*capacity)--;
+	}
+	if (rest && *capacity) {
 		rest &= rest - 1U;
 		(*capacity)--;
 	}
