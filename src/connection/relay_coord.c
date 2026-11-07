@@ -1156,6 +1156,7 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 							p->demand_eligible[age] |= RC_BIT(ch);
 							if (!age) {
 								p->fresh_helper[ch] = h;
+								p->fresh_candidates |= RC_BIT(ch);
 								p->fresh_coverage[h] |= RC_BIT(ch);
 							}
 							break;
@@ -1189,6 +1190,16 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 					}
 					if (c->on_demand) {
 						unsigned lane = 4U - age, bit = copy * 16U + child;
+						if (!age && rc_listener(rc, child, h)) {
+							/* Replace the provisional listener with the actual
+							 * static primary lane, then retain its backup too. */
+							if (!copy && (p->fresh_candidates & RC_BIT(child))) {
+								p->fresh_coverage[p->fresh_helper[child]] &= ~RC_BIT(child);
+							}
+							p->fresh_helper[bit] = h;
+							p->fresh_candidates |= 1U << bit;
+							p->fresh_coverage[h] |= 1U << bit;
+						}
 						p->demand_helper[lane][bit] = h;
 						p->demand_children[lane][h] |= 1U << bit;
 						p->demand_candidates[lane] |= 1U << bit;
@@ -1229,6 +1240,11 @@ void relay_coord_plan_grants(struct relay_coord *rc, struct relay_control *c,
 		relay_control_encode(wire, c);
 		rc_finish_demand(c, p, wire);
 		relay_coord_read_grants(c, wire);
+		for (unsigned i = 0; i < c->repair_count; i++) {
+			unsigned h = c->grants[i].owner;
+			uint32_t children = c->grants[i].children;
+			p->planned_fresh |= h < RC_MAX ? p->fresh_coverage[h] & (children | (children << 16)) : 0;
+		}
 	}
 }
 
@@ -1480,16 +1496,24 @@ static void rc_finish_demand(struct relay_control *c, const struct rc_grant_plan
 		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
 		slot = 2;
 	}
-	for (unsigned lane = 0; lane < 5 && slot < c->repair_count; lane++) {
-		while (pending[lane] && slot < c->repair_count) {
-			unsigned h = p->demand_helper[lane][__builtin_ctz(pending[lane])], capacity = RELAY_MAX_CHILDREN;
-			uint16_t children = 0;
-			for (unsigned k = lane; k < 5 && capacity; k++) {
-				children |= rc_take_records(&pending[k], p->demand_children[k][h], &capacity);
+	unsigned passes = rc_narrow_pool(c) ? 1U : 2U;
+	for (unsigned pass = 0; pass < passes && slot < c->repair_count; pass++) {
+		uint32_t lane_mask = passes == 1 ? UINT32_MAX : pass ? 0xffff0000U : 0xffffU;
+		for (unsigned lane = 0; lane < 5 && slot < c->repair_count; lane++) {
+			while ((pending[lane] & lane_mask) && slot < c->repair_count) {
+				unsigned h = p->demand_helper[lane][__builtin_ctz(pending[lane] & lane_mask)];
+				unsigned capacity = RELAY_MAX_CHILDREN;
+				uint16_t children = 0;
+				for (unsigned group = 0; group < passes && capacity; group++) {
+					uint32_t mask = passes == 1 ? UINT32_MAX : group ? 0xffff0000U : 0xffffU;
+					for (unsigned k = 0; k < 5 && capacity; k++) {
+						children |= rc_take_records(&pending[k], p->demand_children[k][h] & mask, &capacity);
+					}
+				}
+				wire[46 + slot] = h;
+				relay_put_be16(wire + 51 + 2 * slot, children);
+				slot++;
 			}
-			wire[46 + slot] = h;
-			relay_put_be16(wire + 51 + 2 * slot, children);
-			slot++;
 		}
 	}
 	if (p->maintenance >= 0 && slot == 0 && c->repair_count >= 2) {
@@ -1497,14 +1521,7 @@ static void rc_finish_demand(struct relay_control *c, const struct rc_grant_plan
 		wire[46] = wire[47] = RELAY_OWNER_MAINTENANCE;
 		slot = 2;
 	}
-	if (slot < c->repair_count && (relay_control_missing(c, p->rescue_age) & p->rescue_child)) {
-		wire[46 + slot] = p->rescue_helper;
-		relay_put_be16(wire + 51 + 2 * slot, p->rescue_child);
-		slot++;
-	}
-	if (slot < c->repair_count && p->reporter >= 0) {
-		wire[46 + slot] = p->reporter;
-	}
+	/* Apply spare-slot policy once, after frozen receipts are known. */
 	c->survey = p->survey;
 }
 
@@ -1521,42 +1538,91 @@ __ramfunc void relay_coord_finish_static_frozen(struct relay_control *c, const s
 	}
 }
 
+#if defined(__GNUC__) && !defined(__clang__)
+/* Match the measured O3 placement of the static full/narrow allocators. */
+__attribute__((optimize("O3")))
+#endif
 __ramfunc void relay_coord_finish_frozen(struct relay_control *c, const struct rc_grant_plan *p, uint8_t *wire)
 {
 	if (c->on_demand) {
 		uint16_t missing = c->missing[0] | c->missing[1] | c->missing[2] | c->missing_extra[0] | c->missing_extra[1];
-		uint16_t fresh = c->missing[0] & p->demand_eligible[0];
-		unsigned available = 0;
+		/* Every preplanned owner/child pair retains its reservation when
+		 * that child is missing at freeze. Clear the exact covered lanes
+		 * once; a delivered child has no bit in fresh. */
+		uint32_t fresh = (c->missing[0] | ((uint32_t)c->missing[0] << 16)) & p->fresh_candidates & ~p->planned_fresh;
+		unsigned available = 0, repair_slots = 0;
 		for (unsigned i = 0; i < c->repair_count; i++) {
 			uint16_t children = c->grants[i].children & missing;
 			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, children);
-			fresh &= ~children;
-			if (!children) {
+			if (children) {
+				repair_slots |= 1U << i;
+			} else {
 				available |= 1U << i;
 			}
 		}
-		/* Direct receipts after the early snapshot can empty planned grants.
-		 * Fill those slots from qualified current-frame holders at freeze, so an
-		 * open pool can serve a late direct miss at age zero. */
 		if (c->flags & RELAY_CONTROL_MAINTENANCE) {
 			available &= ~3U;
 		}
 		while (fresh && available) {
 			unsigned i = __builtin_ctz(available);
 			available &= available - 1U;
-			unsigned h = p->fresh_helper[__builtin_ctz((unsigned)fresh)];
-			uint16_t children = fresh & p->fresh_coverage[h], rest = children;
+			unsigned h = p->fresh_helper[__builtin_ctz(fresh)];
+			uint32_t records = fresh & p->fresh_coverage[h], rest = records;
 			rest &= rest - 1U;
 			rest &= rest - 1U;
 			rest &= rest - 1U;
-			children ^= rest;
-			fresh &= ~children;
+			records ^= rest;
+			fresh &= ~records;
 			wire[RELAY_CONTROL_OFF_OWNERS + i] = h;
-			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, children);
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, records | (records >> 16));
+			repair_slots |= 1U << i;
+		}
+		/* Match static full-pool spare-slot priority: report, surveyed
+		 * alternate(s), otherwise retry the first repair reservation. */
+		if (available && p->reporter >= 0) {
+			unsigned i = __builtin_ctz(available);
+			available &= available - 1U;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = p->reporter;
+		}
+		if (available && (relay_control_missing(c, p->rescue_age) & p->rescue_child)) {
+			unsigned i = __builtin_ctz(available);
+			available &= available - 1U;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = p->rescue_helper;
+			relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, p->rescue_child);
+			if (available && p->rescue_second < RC_MAX) {
+				i = __builtin_ctz(available);
+				available &= available - 1U;
+				wire[RELAY_CONTROL_OFF_OWNERS + i] = p->rescue_second;
+				relay_put_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i, p->rescue_child);
+			}
+		} else if (available && repair_slots) {
+			unsigned i = __builtin_ctz(available), first = __builtin_ctz(repair_slots);
+			available &= available - 1U;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = wire[RELAY_CONTROL_OFF_OWNERS + first];
+			relay_put_be16(
+				wire + RELAY_CONTROL_OFF_CHILDREN + 2 * i,
+				relay_get_be16(wire + RELAY_CONTROL_OFF_CHILDREN + 2 * first)
+			);
+		}
+		while (available) {
+			unsigned i = __builtin_ctz(available);
+			available &= available - 1U;
+			wire[RELAY_CONTROL_OFF_OWNERS + i] = RELAY_OWNER_IDLE;
+		}
+		uint16_t failed = (c->missing[0] & p->fresh_survey) | c->missing[1] | c->missing[2] | c->missing_extra[0]
+						| c->missing_extra[1];
+		failed &= c->members & ~c->survey;
+		unsigned surveys = c->survey != 0;
+		while (failed && surveys < 2) {
+			unsigned child = __builtin_ctz((unsigned)failed);
+			failed &= failed - 1U;
+			c->survey |= RC_BIT(child);
+			surveys++;
 		}
 
 		return;
 	}
+
 	relay_coord_finish_static_frozen(c, p, wire);
 }
 

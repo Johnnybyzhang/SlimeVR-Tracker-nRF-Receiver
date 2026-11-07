@@ -6044,8 +6044,8 @@ relay_freeze_demand(struct relay_coord *rc, const struct relay_broadcast_work *w
 	for (unsigned age = 0; age < 5; age++) {
 		debt |= relay_control_missing(c, age) & w->plan->demand_eligible[age];
 	}
-	relay_demand_update(&relay_demand_state, c->frame, relay_mask_count(debt), &relay_applied_settings);
-	relay_control_set_next2_repairs(c, relay_frame_repairs(c->frame + 2U));
+	relay_demand_update(&relay_demand_state, c->frame, relay_demand_count(debt), &relay_applied_settings);
+	relay_control_set_next2_repairs(c, relay_demand_state.queued[2]);
 	relay_coord_finish_frozen(c, w->plan, w->wire);
 	relay_control_finish_encode(w->wire, c, w->crc, false);
 }

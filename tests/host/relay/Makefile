@@ -5,6 +5,8 @@ TMP := $(shell mktemp -d 2>/dev/null || echo /tmp/relay-host)
 
 .PHONY: check clean
 check:
+	$(CC) $(CFLAGS) test_demand_coverage.c $(SRC)/relay_coord.c -o $(TMP)/coverage
+	$(TMP)/coverage
 	$(CC) $(CFLAGS) test_b2_deadline.c -o $(TMP)/b2_deadline
 	$(TMP)/b2_deadline
 	$(CC) $(CFLAGS) test_policy.c -o $(TMP)/policy

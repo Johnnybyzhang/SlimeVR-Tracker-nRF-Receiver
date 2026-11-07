@@ -362,6 +362,9 @@ static void simulate(unsigned members, unsigned mode, unsigned trace, unsigned f
 }
 int main(int argc, char **argv)
 {
+	for (unsigned mask = 0; mask <= UINT16_MAX; mask++) {
+		assert(relay_demand_count(mask) == relay_mask_count(mask));
+	}
 	policy();
 	wire();
 	late_direct();

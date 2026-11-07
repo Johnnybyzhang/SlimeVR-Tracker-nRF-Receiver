@@ -2,6 +2,15 @@
 #define RELAY_DEMAND_H
 #include "relay_protocol.h"
 #define RELAY_DEMAND_HOLD 30U
+/* Fixed cost for the frozen demand path, independent of burst cardinality. */
+static inline __attribute__((always_inline)) unsigned relay_demand_count(uint16_t mask)
+{
+	uint32_t n = mask;
+	n -= (n >> 1) & 0x5555U;
+	n = (n & 0x3333U) + ((n >> 2) & 0x3333U);
+	n = (n + (n >> 4)) & 0x0f0fU;
+	return (n + (n >> 8)) & 0x1fU;
+}
 struct relay_demand {
 	uint32_t frame, quiet;
 	uint8_t queued[3], target;

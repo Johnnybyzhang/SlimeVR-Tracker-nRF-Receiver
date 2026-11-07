@@ -172,9 +172,9 @@ def call(name, *values, measure=False):
     u.reg_write(UC_ARM_REG_LR, stop | 1)
     for register, value in zip((UC_ARM_REG_R0, UC_ARM_REG_R1, UC_ARM_REG_R2, UC_ARM_REG_R3), values):
         u.reg_write(register, value)
-    u.emu_start(address | 1, stop, count=100000)
+    u.emu_start(address | 1, stop, count=100000 if measure else 2000000)
     if u.reg_read(UC_ARM_REG_PC) != stop:
-        raise RuntimeError(f'{name} failed to return at {u.reg_read(UC_ARM_REG_PC):#x}')
+        raise RuntimeError(f'{name}{values} failed to return at {u.reg_read(UC_ARM_REG_PC):#x}')
     return u.reg_read(UC_ARM_REG_R0)
 
 
@@ -303,13 +303,12 @@ int main(int argc, char **argv) {
             source = 0x2003c200
             u.mem_write(source, actual)
             at = int.from_bytes(actual[12:16],'big') + ((args.repairs+1)*args.slot_ticks if args.second_b==2 else 2*args.slot_ticks)
-            # Execute the real copy-1 DISABLED/PRX restoration and wait-return,
-            # then encoding/preparation. No assumption that this work happens
+            # Execute the real copy-1 DISABLED/PRX restoration,
+            # then encoding/preparation; caller/wait-return cost is reserved below.
+            # No assumption that this work happens
             # before the first packet END is allowed in the duplicate deadline.
-            call('on_radio_disabled_broadcast', measure=True)
+            call('on_radio_disabled_broadcast.lto_priv.0', measure=True)
             post_end_cycles = cycles + 24
-            assert call('esb_prx_broadcast_wait', 92, measure=True) == 0
-            post_end_cycles += cycles + 24
             write32(sym['radio_operation_busy.lto_priv.0'], 0)
             call('relay_repeat_encode', payload+5, source, at & 0xffffffff, measure=True)
             post_end_cycles += cycles + 24

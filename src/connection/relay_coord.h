@@ -177,8 +177,9 @@ struct rc_grant_plan {
 	uint16_t emergency_child, emergency_coverage;
 	uint8_t emergency_helper;
 	uint16_t demand_eligible[5];
-	uint16_t fresh_coverage[RC_MAX];
-	uint8_t fresh_helper[RC_MAX];
+	uint32_t fresh_candidates, fresh_coverage[RC_MAX];
+	uint32_t planned_fresh;
+	uint8_t fresh_helper[2 * RC_MAX];
 	uint32_t demand_candidates[5];
 	uint32_t demand_children[5][RC_MAX];
 	uint8_t demand_helper[5][32];
