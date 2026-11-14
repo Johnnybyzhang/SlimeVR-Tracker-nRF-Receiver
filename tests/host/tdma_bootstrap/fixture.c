@@ -817,6 +817,53 @@ static void automatic_reentry_continues_frames(void)
 	puts("PASS auto re-entry: B frames continue past the previous engagement");
 }
 
+/* Hardware run 8: `relay v3 off` cleared the permission that also gated B, so
+ * B stopped while the applied profile 1 still ran for the 3.5 s staged exit.
+ * Trackers' B-derived direct anchors expire ~25 ms after the last B, so the
+ * fleet lost TX admission (Total TPS 0) until the exit activated. */
+static void permission_off_keeps_b_through_exit(void)
+{
+	two_member_layout(2, true);
+	now_ms = 6000;
+	service();
+	esb_relay_set_v3_enabled(true);
+	relay_coord.auto_engaged = true;
+	now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; live(); service();
+	assert(relay_profile == 1 && relay_broadcast_eligible());
+	for (unsigned reenable = 0; reenable < 2; reenable++) {
+		esb_relay_set_v3_enabled(false);
+		assert(!relay_coord.v3_requested && !relay_coord.auto_engaged);
+		assert(!relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask)); /* future entry stays gated */
+		assert(relay_broadcast_eligible());
+		now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+		assert(tdma_staged.valid && !tdma_staged.p.profile && relay_profile == 1);
+		uint64_t activation = now_ms + RELAY_LAYOUT_ACTIVATION_MS;
+		for (unsigned step = 0; now_ms + 10 < activation; step++) {
+			/* Permission returning mid-exit is not an engagement: the exit stays staged. */
+			if (reenable && step == 100) {
+				esb_relay_set_v3_enabled(true);
+			}
+			now_ms += 10; live(); service();
+			assert(tdma_staged.valid && relay_profile == 1 && relay_broadcast_eligible());
+		}
+		now_ms = activation + 1; live(); service();
+		assert(!tdma_staged.valid && !relay_profile && !relay_broadcast_eligible());
+		assert(relay_coord.v3_requested == (reenable != 0));
+		if (!reenable) {
+			esb_relay_set_v3_enabled(true);
+			relay_coord.auto_engaged = true;
+			now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+			assert(tdma_staged.valid && tdma_staged.p.profile == 1 && !relay_broadcast_eligible());
+			now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; live(); service();
+			assert(relay_profile == 1 && relay_broadcast_eligible());
+		}
+	}
+	relay_coord.auto_engaged = false;
+	relay_coord.v3_requested = false;
+	puts("PASS permission off: B maintains applied profile 1 until the staged exit activates");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -838,6 +885,7 @@ int main(int argc, char **argv)
     staged_publication();
 	automatic_profile_publication();
 	automatic_reentry_continues_frames();
+	permission_off_keeps_b_through_exit();
 	runtime_settings_publication();
 	member_cap_owner_blocks();
 	puts("PASS staged layout publication: announce, serialize, activate, legacy and forced");

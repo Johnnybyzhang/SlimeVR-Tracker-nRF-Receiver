@@ -6720,10 +6720,18 @@ static void relay_broadcast_plan(struct relay_control *control, struct rc_grant_
 	relay_control_encode(payload->data, control);
 }
 
-static bool relay_broadcast_context_current(const struct relay_control *control, uint32_t origin)
+/* B maintains an applied profile 1 until its staged exit activates. Automatic
+ * permission (`relay v3 off`) only gates future entry: trackers' B-derived
+ * direct anchors last ~25 ms, far shorter than the 3.5 s exit lead. */
+static bool relay_broadcast_eligible(void)
 {
 	return esb_initialized && relay_profile && !esb_pairing
-		&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask) && control->session == relay_session
+		&& relay_coord_v3_capable(&relay_coord, (uint16_t)tdma_active_mask);
+}
+
+static bool relay_broadcast_context_current(const struct relay_control *control, uint32_t origin)
+{
+	return relay_broadcast_eligible() && control->session == relay_session
 		&& control->epoch == relay_epoch && control->members == (uint16_t)tdma_active_mask && origin == relay_origin;
 }
 
@@ -6755,8 +6763,7 @@ static void relay_broadcast_thread(void)
 	for (;;) {
 		unsigned key = irq_lock();
 		IRQ_PROBE_BEGIN(plan);
-		bool active = esb_initialized && relay_profile && !esb_pairing
-			&& relay_coord_v3_ready(&relay_coord, (uint16_t)tdma_active_mask);
+		bool active = relay_broadcast_eligible();
 		uint32_t origin = relay_origin;
 		uint32_t now = (uint32_t)k_uptime_ticks();
 		uint32_t frame = relay_timeline_active.frame, start;

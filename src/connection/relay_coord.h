@@ -333,6 +333,8 @@ bool relay_coord_direct_ready(const struct relay_coord *rc, uint8_t id, uint32_t
 bool relay_coord_is_capable(const struct relay_coord *rc, uint8_t id);
 void relay_coord_set_enabled(struct relay_coord *rc, bool enabled);
 bool relay_coord_v3_ready(const struct relay_coord *rc, uint16_t members);
+/* As v3_ready, without automatic permission: can an applied profile 1 run. */
+bool relay_coord_v3_capable(const struct relay_coord *rc, uint16_t members);
 void relay_coord_pin(struct relay_coord *rc, uint8_t id, bool pinned);
 
 #endif
