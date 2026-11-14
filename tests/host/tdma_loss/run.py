@@ -21,6 +21,7 @@ from relay_support import relay_section, staging_helpers  # noqa: E402
 
 
 CASES = (
+    'auto-policy-ladder', 'auto-outage-pending', 'auto-excluded-live', 'auto-nonv3-join',
     'fast-recovery',
     'slow-probe',
     'sparse-recovery',
@@ -207,6 +208,8 @@ static void restart_ping(uint8_t tracker_id) {
 '''
     return '\n'.join((
         constants,
+        "static bool relay_auto_ladder_paused(void);",
+        "static uint32_t tdma_admissible_mask(uint32_t desired);",
         ping_constants,
         membership_declarations(source),
         declarations,
@@ -225,6 +228,7 @@ static void restart_ping(uint8_t tracker_id) {
         diagnostic_function(source, 'account_ping_clock'),
         function(source, 'esb_receive_ping'),
         relay_section(source, stats=False) if relay else '',
+        function(source, 'relay_auto_ladder_paused'),
         extract_block(source, r'^struct composite_result\s*\{', True),
         function(source, 'composite_validate'),
         function(source, 'esb_execute_composite'),
@@ -264,7 +268,7 @@ def main():
         binary = path / 'test'
         compiler = shlex.split(os.environ.get('CC', 'cc'))
         flags = [
-            '-std=c11',
+            '-std=c11', '-fsanitize=address,undefined', '-fno-omit-frame-pointer', '-g', '-O1',
             '-Wall',
             '-Wextra',
             '-Werror',

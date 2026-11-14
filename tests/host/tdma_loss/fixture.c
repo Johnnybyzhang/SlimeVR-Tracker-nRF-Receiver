@@ -697,10 +697,126 @@ static void decision_genuine_loss(void)
 	}
 }
 
+/* One policy owns the loss ladder and relay lifecycle. Use the production
+ * quality accounting, auto policy and loss controller in the same timeline. */
+static void auto_policy_ladder(void)
+{
+	relay_coord_init(&relay_coord);
+	relay_coord.v3_requested = true;
+	relay_coord_note_caps(&relay_coord, 3,
+		(RELAY_V3_VERSION << RELAY_CAP_VERSION_SHIFT) | RELAY_CAP_HELPER);
+	tdma_cap_level = tdma_published_cap_level = 0;
+	for (unsigned second = 0; second < 15; second++) {
+		now += 1000;
+		for (unsigned n = 0; n < 60; n++)
+			relay_coord_note_frame(&relay_coord, 3, RC_DIRECT, RC_SEQ_NORMAL,
+				n == 0 ? 40 : 0, 70, now);
+		relay_coord_tick(&relay_coord, BIT(3), now);
+		relay_coord_auto_update(&relay_coord, BIT(3), now, false, true);
+		tracker_slots[3].decision_received += 120;
+		tracker_slots[3].decision_gaps += 80;
+		decision_ready_mask = tdma_active_mask;
+		tdma_loss_controller_tick(now);
+		if (second == 4) {
+			assert(tdma_cap_level == 1); /* ladder acts first */
+			tdma_published_cap_level = tdma_cap_level;
+		}
+		if (second < 11) assert(!relay_coord.auto_engaged);
+	}
+	assert(relay_coord.auto_engaged && tdma_cap_level == 2);
+	tdma_published_cap_level = tdma_cap_level;
+	relay_profile = 1;
+	repeat(120, 200, 0); /* repair-success delivery cannot raise the cap */
+	assert(tdma_cap_level == 2);
+	relay_coord.auto_engaged = false;
+	repeat(120, 200, 0); /* staged exit still freezes it */
+	assert(tdma_cap_level == 2);
+	relay_profile = 0;
+	repeat(9, 200, 0); assert(tdma_cap_level == 2);
+	tick(200, 0); assert(tdma_cap_level == 1);
+}
+
+static void auto_outage_pending(void)
+{
+	relay_coord_init(&relay_coord);
+	relay_coord.v3_requested = true;
+	relay_coord_note_caps(&relay_coord, 3, RELAY_INFO_CAPS);
+	/* Learn 10 Hz from four pooled windows, then go entirely silent. */
+	for (unsigned tick = 0; tick < 30; tick++) {
+		now += 500;
+		if (tick < 4) {
+			tdma_shadow_observe(3, TDMA_SHADOW_EVIDENCE_DATA);
+			for (unsigned n = 0; n < 5; n++)
+				relay_coord_note_frame(&relay_coord, 3, RC_DIRECT, RC_SEQ_NORMAL, 0, 70, now);
+		}
+		tdma_shadow_update(now);
+		relay_coord_tick(&relay_coord, tdma_active_mask, now);
+		struct esb_auto_loss_snapshot evidence;
+		esb_get_auto_loss_snapshot(&evidence);
+		if (tdma_shadow_pending_leave_mask) {
+			assert(!evidence.eligible && evidence.relay_eligible);
+		}
+		relay_coord_auto_update(&relay_coord, tdma_active_mask, now, false, evidence.relay_eligible);
+		if (relay_coord.auto_engaged) {
+			assert(tdma_shadow_pending_leave_mask == BIT(3));
+			assert(tdma_active_mask == BIT(3));
+			assert(now - relay_coord.t[3].last_direct_ms < 11000);
+			return; /* leaves the 3500 ms staging margin before 15 s eviction */
+		}
+	}
+	assert(false);
+}
+
+static void auto_excluded_live(void)
+{
+	relay_coord_init(&relay_coord);
+	relay_coord.v3_requested = true;
+	relay_coord_note_caps(&relay_coord, 3, RELAY_INFO_CAPS);
+	stored_trackers = 5;
+	relay_settings.max_trackers = 1;
+	tdma_shadow_desired_mask = BIT(3) | BIT(4);
+	for (unsigned tick = 0; tick < 90; tick++) {
+		now += 500;
+		unsigned direct = tick < 24 ? 30 : 50;
+		for (unsigned n = 0; n < direct; n++)
+			relay_coord_note_frame(&relay_coord, 3, RC_DIRECT, RC_SEQ_NORMAL,
+				n == 0 ? 50 - direct : 0, 70, now);
+		relay_coord_tick(&relay_coord, BIT(3), now);
+		struct esb_auto_loss_snapshot evidence;
+		esb_get_auto_loss_snapshot(&evidence);
+		assert(evidence.relay_eligible);
+		relay_coord_auto_update(&relay_coord, BIT(3), now, tick >= 24, evidence.relay_eligible);
+		if (tick == 23) assert(relay_coord.auto_engaged);
+	}
+	assert(!relay_coord.auto_engaged);
+	tdma_shadow_pending_join_mask = BIT(4);
+	struct esb_auto_loss_snapshot evidence;
+	esb_get_auto_loss_snapshot(&evidence);
+	assert(!evidence.relay_eligible); /* true pending joins still fence policy */
+}
+
+static void auto_nonv3_join(void)
+{
+	auto_policy_ladder();
+	relay_coord.auto_engaged = true;
+	relay_profile = 1;
+	relay_coord_auto_update(&relay_coord, BIT(3) | BIT(4), now, true, false);
+	assert(!relay_coord.auto_engaged && relay_auto_ladder_paused());
+	relay_profile = 0;
+	assert(!relay_auto_ladder_paused());
+	tdma_cap_level = tdma_published_cap_level = 3;
+	repeat(11, 200, 0);
+	assert(tdma_cap_level == 2);
+}
+
 static const struct {
 	const char *name;
 	void (*run)(void);
 } scenarios[] = {
+	{"auto-policy-ladder", auto_policy_ladder},
+	{"auto-outage-pending", auto_outage_pending},
+	{"auto-excluded-live", auto_excluded_live},
+	{"auto-nonv3-join", auto_nonv3_join},
 	{"fast-recovery", fast_recovery},
 	{"slow-probe", slow_probe},
 	{"sparse-recovery", sparse_recovery},

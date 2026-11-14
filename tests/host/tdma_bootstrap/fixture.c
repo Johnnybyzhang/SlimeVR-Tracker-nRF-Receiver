@@ -590,6 +590,7 @@ static void runtime_settings_publication(void)
 	relay_settings = (struct relay_runtime_settings){2, 1, 16, 100, 120};
 	relay_settings_generation++;
 	relay_coord.v3_requested = true;
+	relay_coord.auto_engaged = true; /* test-only forced profile request */
 	force_layout();
 	assert(tdma_staged.valid && !relay_profile && tdma_staged.p.profile == 1);
 	assert(tdma_staged.p.new_mask == 3 && tdma_staged.p.geometry.direct == 2);
@@ -704,6 +705,7 @@ static void member_cap_owner_blocks(void)
 	relay_settings = (struct relay_runtime_settings){2, 1, 16, 100, 120, 0};
 	relay_settings_generation++;
 	relay_coord.v3_requested = true;
+	relay_coord.auto_engaged = true; /* test-only forced profile request */
 	force_layout();
 	assert(tdma_staged.valid && tdma_staged.p.new_mask == 3);
 	for (unsigned ms = 0; ms + 10 < RELAY_LAYOUT_ACTIVATION_MS; ms += 10) {
@@ -728,6 +730,93 @@ static void member_cap_owner_blocks(void)
 	puts("PASS member cap: owner sleeps while staged and with live members above max_trackers");
 }
 
+static void automatic_profile_publication(void)
+{
+	two_member_layout(2, true);
+	now_ms = 6000;
+	service();
+	relay_coord.v3_requested = true;
+	force_layout();
+	assert(!relay_profile && !tdma_staged.valid && !relay_forward_published);
+	/* A pending cap must not impose the ladder's 15 s delay on a profile switch. */
+	tdma_cap_level = 3;
+	tdma_published_cap_level = 0;
+	tdma_last_reconfig_time = now_ms;
+	relay_coord.auto_engaged = true;
+	now_ms += TDMA_RECONFIG_MIN_MS;
+	service();
+	assert(tdma_staged.valid && tdma_staged.p.profile == 1 && !relay_profile);
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1;
+	service();
+	assert(relay_profile == 1 && !tdma_staged.valid);
+	/* Admit a v3 join while engaged. Its staged publication retains cap 3. */
+	stored_trackers = 3;
+	relay_coord_note_caps(&relay_coord, 2, RELAY_INFO_CAPS);
+	now_ms += TDMA_RECONFIG_MIN_MS;
+	assert(ping(0, true) && ping(1, true) && ping(2, true)); service();
+	now_ms += 101; service();
+	assert(tdma_staged.valid && tdma_staged.p.new_mask == 7);
+	assert(tdma_cap_level == 3 && tdma_staged.p.cap_level == 3);
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; service();
+	assert(tdma_published_cap_level == 3);
+	relay_coord.auto_engaged = false; /* recovery decision, permission stays on */
+	now_ms += TDMA_RECONFIG_MIN_MS;
+	service();
+	assert(tdma_staged.valid && !tdma_staged.p.profile && relay_profile == 1);
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1;
+	service();
+	assert(!relay_profile && !tdma_staged.valid && relay_coord.v3_requested);
+	assert(tdma_cap_level == 3 && tdma_published_cap_level == 3);
+	puts("PASS auto profile: permission stays direct, entry and recovery use staged activation");
+}
+
+/* Both members keep pinging, so membership never changes. */
+static void live(void)
+{
+	assert(ping(0, true) && ping(1, true));
+}
+
+/* Hardware run 3 (H3): the session is drawn once per boot, and trackers keep
+ * its last B frame across a profile exit, dropping any B that does not
+ * advance it (pr-tracker esb_relay_control_receive). A second engagement
+ * restarted B at frame 0, so no B was accepted until the 3 s layout grant
+ * expired, no repairs flowed, and a direct-blocked member was evicted. */
+static void automatic_reentry_continues_frames(void)
+{
+	two_member_layout(2, true);
+	now_ms = 6000;
+	service();
+	relay_coord.v3_requested = true;
+	relay_timeline_clear(&relay_timeline_active); /* first engagement since boot */
+	relay_coord.auto_engaged = true;
+	now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; live(); service();
+	assert(relay_profile == 1 && relay_timeline_active.frame == 0);
+	uint32_t session = relay_session, start;
+	/* The B thread announces each frame before it sends that frame's B. */
+	for (uint32_t frame = 1; frame <= 600; frame++) {
+		assert(relay_timeline_start(&relay_timeline_active, frame, &start));
+		relay_frame_announce(frame, start);
+	}
+	uint32_t last_b = relay_timeline_active.frame;
+	relay_coord.auto_engaged = false;
+	now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; live(); service();
+	assert(!relay_profile && !tdma_staged.valid);
+	relay_coord.auto_engaged = true;
+	now_ms += TDMA_RECONFIG_MIN_MS; live(); service();
+	assert(tdma_staged.valid && tdma_staged.p.profile == 1);
+	now_ms += RELAY_LAYOUT_ACTIVATION_MS + 1; live(); service();
+	assert(relay_profile == 1 && relay_session == session);
+	/* The first B of the new engagement advances past the tracker's last. */
+	assert((int32_t)(relay_timeline_active.frame - last_b) > 0);
+	assert(relay_timeline_start(&relay_timeline_active, relay_timeline_active.frame, &start));
+	assert(start == tdma_staged.activation_ticks);
+	relay_coord.auto_engaged = false;
+	relay_coord.v3_requested = false;
+	puts("PASS auto re-entry: B frames continue past the previous engagement");
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2) {
@@ -747,6 +836,8 @@ int main(int argc, char **argv)
     owner_store_lock_delay();
     restore_retry();
     staged_publication();
+	automatic_profile_publication();
+	automatic_reentry_continues_frames();
 	runtime_settings_publication();
 	member_cap_owner_blocks();
 	puts("PASS staged layout publication: announce, serialize, activate, legacy and forced");

@@ -240,6 +240,7 @@ static void tdma_recalculate(bool forced);
 #if defined(CONFIG_RELAY)
 /* Peer relay coordinator (see the relay section below). */
 static struct relay_coord relay_coord;
+static bool relay_auto_ladder_paused(void);
 static bool relay_user_enabled = true;
 static uint16_t relay_forward_published;
 #endif
@@ -917,7 +918,10 @@ static void tdma_apply_locked(const struct tdma_publication *p, int64_t now)
 	relay_applied_settings = relay_runtime_for_members(p->settings, p->active_count);
 	relay_coord.cache_frames = relay_applied_settings.repair_floor < relay_applied_settings.max_repairs ? 5 : 3;
 	if (p->profile) {
-		uint32_t seed = relay_profile ? relay_timeline_active.frame + 1U : 0U;
+		/* Trackers keep the last B frame of this session and reject any B
+		 * that does not advance it, so a re-entry continues the count. */
+		uint32_t seed = relay_profile || relay_timeline_active.valid
+			? relay_timeline_active.frame + 1U : 0U;
 		relay_receiver_geometry = p->geometry;
 		relay_origin = tdma_staged.activation_ticks;
 		relay_frame_anchor = seed;
@@ -1032,7 +1036,10 @@ static void tdma_recalculate(bool forced)
 
 		bool mask_changed = new_mask != old_mask;
 		if (mask_changed) {
-			tdma_cap_level = 0;
+#if defined(CONFIG_RELAY)
+			if (!relay_auto_ladder_paused())
+#endif
+				tdma_cap_level = 0;
 			tdma_loss_reset_windows();
 		} else if (data_collect_is_active() || data_collect_batch_is_active()) {
 			tdma_cap_level = tdma_published_cap_level;
@@ -1041,8 +1048,8 @@ static void tdma_recalculate(bool forced)
 		/* Relay forwarding slots follow the direct members' slots. They
 		 * count toward the per-tracker rate cap like any other slot. */
 		uint16_t forward_mask = active_count
-			? relay_coord_forward_wanted(&relay_coord, (uint16_t)new_mask) : 0;
-		uint8_t profile = relay_coord_v3_ready(&relay_coord, (uint16_t)new_mask) ? RELAY_PROFILE_120HZ : 0;
+			&& !relay_coord.v3_requested ? relay_coord_forward_wanted(&relay_coord, (uint16_t)new_mask) : 0;
+		uint8_t profile = relay_coord.auto_engaged && relay_coord_v3_ready(&relay_coord, (uint16_t)new_mask) ? RELAY_PROFILE_120HZ : 0;
 		if (profile) {
 			forward_mask = 0;
 		}
@@ -1075,7 +1082,11 @@ static void tdma_recalculate(bool forced)
 			return;
 		}
 
-		uint32_t min_reconfig_ms = (mask_changed || test_all_layout || !ladder_step)
+		uint32_t min_reconfig_ms = (mask_changed || test_all_layout || !ladder_step
+#if defined(CONFIG_RELAY)
+			|| profile != relay_profile
+#endif
+		)
 			? TDMA_RECONFIG_MIN_MS : TDMA_LOSS_RECONFIG_MIN_MS;
 		if (!forced && ((mask_changed && tdma_membership_deadline_armed
 		    && (int32_t)((uint32_t)now - tdma_membership_deadline_ms) < 0)
@@ -1365,13 +1376,21 @@ void esb_get_auto_loss_snapshot(struct esb_auto_loss_snapshot *out)
 	out->eligible = !esb_radio_fault && !esb_channel_is_busy() && !esb_pairing
 		&& !esb_clearing && !esb_ota_relay_is_active() && !receiver_ota_is_active()
 		&& !data_collect_is_active() && !data_collect_batch_is_active()
-		&& !(atomic_get(&test_all_state_valid) && atomic_get(&test_all_enabled))
+		&& !(atomic_get(&test_all_state_valid) && atomic_get(&test_all_enabled));
+	out->relay_eligible = out->eligible
+#if defined(CONFIG_RELAY)
+		&& out->active_mask == tdma_admissible_mask((uint32_t)atomic_get(&tdma_shadow_desired_mask))
+#else
+		&& out->active_mask == (uint32_t)atomic_get(&tdma_shadow_desired_mask)
+#endif
+		&& !atomic_get(&tdma_shadow_pending_join_mask);
+	out->eligible = out->eligible
 		&& out->active_mask == (uint32_t)atomic_get(&tdma_shadow_desired_mask)
 		&& !atomic_get(&tdma_shadow_pending_join_mask)
 		&& !atomic_get(&tdma_shadow_pending_leave_mask);
 	for (uint8_t i = 0; i < MAX_TRACKERS; ++i) {
 		if (esb_ota_relay_abort_pending(i)) {
-			out->eligible = false;
+			out->eligible = out->relay_eligible = false;
 		}
 	}
 	irq_unlock(key);
@@ -1510,6 +1529,16 @@ static void tdma_loss_controller_update(int64_t now)
 		tick_received += delta_recv;
 		tick_gaps += delta_gaps;
 	}
+
+#if defined(CONFIG_RELAY)
+	/* Profile 1 has fixed geometry. Freeze the cap from request through
+	 * staged exit; repairs must neither raise TPS nor manufacture recovery.
+	 * Rebase ladder windows here so direct mode starts with fresh evidence. */
+	if (relay_auto_ladder_paused()) {
+		tdma_loss_reset_windows();
+		return;
+	}
+#endif
 
 	/* Always advance snapshots above. Otherwise leaving an excluded mode would
 	 * collapse its entire accumulated traffic into one fake 1 s loss window. */
@@ -2268,8 +2297,18 @@ static void esb_stats_thread(void)
 				relay_coord_set_enabled(&relay_coord, relay_enabled);
 			}
 			(void)relay_coord_tick(&relay_coord, (uint16_t)tdma_active_mask, k_uptime_get_32());
+			struct esb_auto_loss_snapshot auto_evidence;
+			esb_get_auto_loss_snapshot(&auto_evidence);
+			bool was_engaged = relay_coord.auto_engaged;
+			relay_coord_auto_update(&relay_coord, (uint16_t)tdma_active_mask,
+				k_uptime_get_32(), relay_profile != 0, auto_evidence.relay_eligible);
+			bool engaged = relay_coord.auto_engaged;
 			IRQ_PROBE_END(tick);
 			irq_unlock(relay_key);
+			if (was_engaged != engaged) {
+				LOG_INF("relay auto %s: direct quality, cap=%u",
+					engaged ? "ENTER" : "EXIT", tdma_cap_level);
+			}
 		}
 
 		/* Proof can invalidate both incumbents in this 500 ms window.
@@ -2964,6 +3003,12 @@ static void esb_ack_handler_cb(
 			uint8_t epoch = (uint8_t)(tdma_advertised_config(tracker_id, rx_ticks) & 0xFFU);
 			uint16_t members = (uint16_t)(due ? tdma_staged.p.new_mask : tdma_active_mask);
 			relay_coord_trailer(&relay_coord, tracker_id, epoch, members, &trailer);
+			/* Automatic v3 never starts legacy head overhearing in profile 0. */
+			if (relay_coord.v3_requested && (due ? !tdma_staged.p.profile : !relay_profile)) {
+				trailer.children_mask = 0;
+				trailer.forward_slot = RELAY_NO_SLOT;
+				trailer.relayed_mask = 0;
+			}
 			trailer.pending = false;
 			/* Announce a staged layout on NORMAL PONGs, whose bytes 3..6
 			 * carry the receiver timestamp the activation is relative to. */
@@ -6044,6 +6089,12 @@ static void esb_thread(void)
 /* ---------------------------------------------------------------------------
  * Relay console / OTA interface.
  * ------------------------------------------------------------------------- */
+static bool relay_auto_ladder_paused(void)
+{
+	return relay_coord.auto_engaged || relay_profile
+		|| (tdma_staged.valid && tdma_staged.p.profile);
+}
+
 void esb_relay_set_enabled(bool enabled)
 {
 	unsigned int key = irq_lock();
@@ -6056,6 +6107,10 @@ void esb_relay_set_v3_enabled(bool enabled)
 {
 	unsigned int key = irq_lock();
 	relay_coord.v3_requested = enabled;
+	if (!enabled) {
+		relay_coord.auto_engaged = false;
+		relay_coord.auto_poor_since = relay_coord.auto_good_since = 0;
+	}
 	irq_unlock(key);
 }
 

@@ -184,6 +184,8 @@ struct esb_auto_loss_snapshot {
 	bool cap_pending;
 	uint8_t home;
 	bool eligible;
+	/* Relay can use silence while a member awaits normal eviction. */
+	bool relay_eligible;
 };
 void esb_get_auto_loss_snapshot(struct esb_auto_loss_snapshot *out);
 /* Invalidate evidence at excluded-session admission, including short sessions

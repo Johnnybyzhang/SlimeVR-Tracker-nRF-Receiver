@@ -29,6 +29,18 @@
 #define RELAY_RAMFUNC
 #endif
 #define RC_WINDOW_MS 500U
+/* Profile policy: the direct TPS ladder gets its five 1 s loss ticks first.
+ * Any poor member can engage. Leaving needs RC_AUTO_RECOVER_MS with no member
+ * weak or silent, and every member remembered as poor during the engagement
+ * pooled at RC_GOOD_PERMILLE or better across that window. A member joins the
+ * remembered set when poor on the engaging tick, or once weak continuously
+ * for RC_AUTO_ENTER_MS while engaged. */
+#define RC_AUTO_ENTER_MS 10000U
+/* Leave time for the staged activation before 15 s membership eviction. */
+#define RC_AUTO_OUTAGE_ENTER_MS 5000U
+#define RC_AUTO_RECOVER_MS 20000U
+#define RC_AUTO_HOLD_MS 30000U
+#define RC_AUTO_QUALITY_MAX_MS (RC_JUDGE_MAX_WINDOWS * RC_WINDOW_MS)
 
 /* Weak: direct delivery below this share of expected frames (>= RC_MIN_EXPECTED
  * frames in the window) for RC_WEAK_WINDOWS consecutive windows, or direct
@@ -112,6 +124,7 @@ struct rc_tracker {
 	bool direct_seen;
 	bool relay_needed;      /* survives head loss until direct recovery or dormancy */
 	uint16_t direct_permille; /* last judgement */
+	uint32_t quality_ms; /* freshness of that judgement */
 	uint16_t acc_direct;      /* frames carried towards the next judgement */
 	uint16_t acc_expected;
 	uint8_t acc_windows;
@@ -202,6 +215,16 @@ static inline const struct rc_watch *relay_plan_watch_const(const struct rc_gran
 }
 
 struct relay_coord {
+	bool auto_engaged, auto_applied;
+	uint16_t auto_members, auto_poor_members;
+	uint32_t auto_poor_since, auto_good_since, auto_applied_since;
+	/* Per member, over the recovery window: sum of 10 * direct - 9 * expected
+	 * frames of each judgement, clamped to int16. Until it first clamps,
+	 * >= 0 means exactly pooled >= 900; a clamped sum keeps its sign at the
+	 * clamp but may have a different sign from the unclamped sum. */
+	int16_t auto_balance[RC_MAX];
+	/* Per member: start of its current weak streak, 0 = not weak. */
+	uint32_t auto_weak_since[RC_MAX];
 	uint8_t cache_frames;
 	struct rc_peer peer[RC_MAX][RC_MAX]; /* helper -> child */
 	struct rc_choice choice[RC_MAX][2];
@@ -291,6 +314,8 @@ void relay_coord_note_trailer_sent(struct relay_coord *rc, uint8_t head, uint16_
 /* member_mask: direct TDMA members. Returns the desired forwarding mask; the
  * owner re-lays-out when it differs from the published one and then calls
  * relay_coord_set_forward_layout(). */
+void relay_coord_auto_update(struct relay_coord *rc, uint16_t members,
+	uint32_t now, bool applied, bool eligible);
 uint16_t relay_coord_tick(struct relay_coord *rc, uint16_t member_mask, uint32_t now_ms);
 void relay_coord_set_forward_layout(struct relay_coord *rc, uint16_t forward_mask);
 /* Desired forwarding mask given members (bounded by RC_MAX_TOTAL_SLOTS). */

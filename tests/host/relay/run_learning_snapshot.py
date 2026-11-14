@@ -70,7 +70,12 @@ cadence=r'''
 #include <assert.h>
 #include <stdbool.h>
 #include <stdint.h>
-static struct { bool enabled; } relay_coord;
+static struct { bool enabled, auto_engaged; } relay_coord;
+static unsigned relay_profile, tdma_cap_level;
+struct esb_auto_loss_snapshot { bool eligible; };
+#define esb_get_auto_loss_snapshot(e) ((e)->eligible=true)
+#define relay_coord_auto_update(c,m,t,p,e) ((void)0)
+#define LOG_INF(...) ((void)0)
 static bool relay_user_enabled=true;
 static unsigned tdma_active_mask=0x7ff, proof_updates, choice_updates;
 static bool esb_ota_relay_is_active(void){return false;}

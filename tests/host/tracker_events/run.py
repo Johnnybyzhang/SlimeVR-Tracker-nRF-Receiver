@@ -205,7 +205,7 @@ def main():
             'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
             'tdma_admissible_mask', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked',
             'tdma_slot_ticks_for', 'tdma_staging_supported_locked', 'tdma_apply_locked',
-            'tdma_apply_finish', 'tdma_recalculate'))
+            'tdma_apply_finish', 'relay_auto_ladder_paused', 'tdma_recalculate'))
         lengths = function(esb, 'composite_body_length')
         composite = extract_block(esb, r'^struct composite_result\s*\{', True) + '\n' + '\n'.join(function(esb, n) for n in ('composite_validate', 'esb_execute_composite', 'esb_receive_composite'))
         clear = function(esb, 'esb_clear')

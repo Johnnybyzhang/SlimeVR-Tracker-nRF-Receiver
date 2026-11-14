@@ -21,6 +21,8 @@ static bool rc_after(uint32_t now, uint32_t then, uint32_t interval)
 	return (uint32_t)(now - then) >= interval;
 }
 
+static void rc_auto_restart(struct relay_coord *rc);
+
 void relay_coord_init(struct relay_coord *rc)
 {
 	memset(rc, 0, sizeof(*rc));
@@ -90,6 +92,10 @@ void relay_coord_forget(struct relay_coord *rc, uint8_t id, uint32_t now_ms)
 		rc->t[id].fwd_revoke_ms = now_ms;
 	}
 	memset(&rc->w[id], 0, sizeof(rc->w[id]));
+	/* A new session owes nothing for the old one's poor direct link. */
+	rc->auto_poor_members &= (uint16_t)~RC_BIT(id);
+	rc->auto_weak_since[id] = 0;
+	rc_auto_restart(rc);
 	for (unsigned i = 0; i < RC_MAX; i++) {
 		rc->ban_until[id][i] = rc->ban_until[i][id] = 0;
 		rc->pair_score[id][i] = rc->pair_score[i][id] = RC_DEFAULT_PAIR_SCORE;
@@ -179,11 +185,13 @@ static uint8_t rc_head_count(const struct relay_coord *rc)
 struct rc_judgement {
 	uint16_t expected;
 	uint16_t permille;
+	uint16_t direct;
 };
 
 static struct rc_judgement rc_judge(const struct rc_window *w)
 {
 	struct rc_judgement j;
+	j.direct = w->direct;
 	j.expected = (uint16_t)(w->direct + w->relayed + w->gaps);
 	j.permille = j.expected ? (uint16_t)((uint32_t)w->direct * 1000U / j.expected) : 1000U;
 	return j;
@@ -194,12 +202,13 @@ static struct rc_judgement rc_judge(const struct rc_window *w)
 static struct rc_judgement rc_accumulate(struct rc_tracker *t, const struct rc_window *w)
 {
 	struct rc_judgement in = rc_judge(w);
-	struct rc_judgement out = {0, 1000U};
+	struct rc_judgement out = {0, 1000U, 0};
 	t->acc_direct = (uint16_t)(t->acc_direct + w->direct);
 	t->acc_expected = (uint16_t)(t->acc_expected + in.expected);
 	t->acc_windows++;
 	if (t->acc_expected >= RC_MIN_EXPECTED) {
 		out.expected = t->acc_expected;
+		out.direct = t->acc_direct;
 		out.permille = (uint16_t)((uint32_t)t->acc_direct * 1000U / t->acc_expected);
 	}
 	if (out.expected || t->acc_windows >= RC_JUDGE_MAX_WINDOWS) {
@@ -220,6 +229,124 @@ static bool rc_direct_quiet(const struct rc_tracker *t, uint32_t now)
 	}
 	uint32_t gap = now - t->last_direct_ms;
 	return (uint64_t)gap * t->rate_x16 >= (uint64_t)RC_MIN_EXPECTED * 16U * RC_WINDOW_MS;
+}
+
+/* Members weak by the entry streak rule on a fresh judgement. */
+static uint16_t rc_auto_weak(const struct relay_coord *rc, uint16_t members, uint32_t now)
+{
+	uint16_t weak = 0;
+	for (unsigned i = 0; i < RC_MAX; i++) {
+		const struct rc_tracker *t = &rc->t[i];
+		if ((members & RC_BIT(i)) && t->seen && t->weak_windows >= RC_WEAK_WINDOWS
+		    && !rc_after(now, t->quality_ms, RC_AUTO_QUALITY_MAX_MS))
+			weak |= RC_BIT(i);
+	}
+	return weak;
+}
+
+_Static_assert(RC_GOOD_PERMILLE % 100U == 0U, "exact pooled recovery balance");
+/* Pool one judgement into the recovery window. Until the balance first
+ * clamps, it is >= 0 exactly while direct / expected frames across the window
+ * is >= RC_GOOD_PERMILLE. After clamping, its sign can differ from that pool. */
+static void rc_auto_pool(int16_t *balance, struct rc_judgement j)
+{
+	int32_t b = *balance + ((int32_t)j.direct * 1000
+		- (int32_t)j.expected * (int32_t)RC_GOOD_PERMILLE) / 100;
+	*balance = (int16_t)(b > INT16_MAX ? INT16_MAX : b < INT16_MIN ? INT16_MIN : b);
+}
+
+static void rc_auto_restart(struct relay_coord *rc)
+{
+	rc->auto_good_since = 0;
+	memset(rc->auto_balance, 0, sizeof(rc->auto_balance));
+}
+
+/* Track each member's weak streak; return members weak continuously for the
+ * entry rule's RC_AUTO_ENTER_MS. weak = 0 clears every streak. */
+static uint16_t rc_auto_sustained(struct relay_coord *rc, uint16_t weak, uint32_t now)
+{
+	uint16_t sustained = 0;
+	for (unsigned i = 0; i < RC_MAX; i++) {
+		if (!(weak & RC_BIT(i))) rc->auto_weak_since[i] = 0;
+		else if (!rc->auto_weak_since[i]) rc->auto_weak_since[i] = now | 1U;
+		else if ((int32_t)(now - rc->auto_weak_since[i]) >= (int32_t)RC_AUTO_ENTER_MS)
+			sustained |= RC_BIT(i);
+	}
+	return sustained;
+}
+
+/* Called after the 500 ms quality judgement. No delivery statistic can
+ * authorize exit: repaired frames remain missing from direct_permille. */
+void relay_coord_auto_update(struct relay_coord *rc, uint16_t members,
+	uint32_t now, bool applied, bool eligible)
+{
+	if (!relay_coord_v3_ready(rc, members)) {
+		rc->auto_engaged = false;
+		rc->auto_poor_since = 0;
+		rc_auto_restart(rc);
+	}
+	/* A member that leaves owes nothing; one that rejoins starts unremembered. */
+	rc->auto_poor_members &= rc->auto_engaged ? members : 0U;
+	if (applied && !rc->auto_applied) rc->auto_applied_since = now;
+	rc->auto_applied = applied;
+	if (!eligible || members != rc->auto_members) {
+		/* A roster change resets the windows, not this tick's evidence. */
+		uint16_t sustained = rc_auto_sustained(rc, eligible ? rc_auto_weak(rc, members, now) : 0U, now);
+		if (rc->auto_engaged) rc->auto_poor_members |= sustained;
+		rc->auto_poor_since = 0;
+		rc_auto_restart(rc);
+		rc->auto_members = members;
+		return;
+	}
+	if (!relay_coord_v3_ready(rc, members)) {
+		rc->auto_poor_since = 0;
+		rc_auto_restart(rc);
+		(void)rc_auto_sustained(rc, 0U, now);
+		return;
+	}
+	uint16_t weak = rc_auto_weak(rc, members, now), poor = weak;
+	bool fresh = true, outage = false;
+	for (unsigned i = 0; i < RC_MAX; i++) {
+		if (!(members & RC_BIT(i))) continue;
+		const struct rc_tracker *t = &rc->t[i];
+		if (rc_direct_quiet(t, now)) {
+			poor |= RC_BIT(i);
+			outage = true;
+		}
+		fresh &= t->seen && !rc_after(now, t->quality_ms, RC_AUTO_QUALITY_MAX_MS);
+	}
+	/* Isolated judgements below RC_WEAK_PERMILLE neither mark a member nor
+	 * restart recovery; a weak streak, silence or stale quality restarts it.
+	 * Only a streak as long as the entry window marks an untouched member. */
+	uint16_t sustained = rc_auto_sustained(rc, weak, now);
+	if (rc->auto_engaged) rc->auto_poor_members |= sustained;
+	if (!poor) rc->auto_poor_since = 0;
+	else if (!rc->auto_poor_since) rc->auto_poor_since = now | 1U;
+	if (poor || !fresh) rc_auto_restart(rc);
+	else if (!rc->auto_good_since) rc->auto_good_since = now | 1U;
+	uint32_t enter_ms = outage ? RC_AUTO_OUTAGE_ENTER_MS : RC_AUTO_ENTER_MS;
+	if (!rc->auto_engaged && rc->auto_poor_since
+	    && (int32_t)(now - rc->auto_poor_since) >= (int32_t)enter_ms) {
+		rc->auto_engaged = true;
+		rc->auto_poor_members = poor; /* the trigger set */
+		rc_auto_restart(rc);
+	} else if (rc->auto_engaged && rc->auto_good_since
+	    && (int32_t)(now - rc->auto_good_since) >= (int32_t)RC_AUTO_RECOVER_MS) {
+		/* Untouched links need only stay non-weak. Every remembered link
+		 * must pool the separate good threshold over the window. */
+		bool owed = false;
+		for (unsigned i = 0; i < RC_MAX; i++)
+			owed |= (rc->auto_poor_members & RC_BIT(i)) && rc->auto_balance[i] < 0;
+		if (owed) {
+			/* Consecutive windows: early loss is not averaged away. */
+			rc_auto_restart(rc);
+		} else if (applied && rc_after(now, rc->auto_applied_since, RC_AUTO_HOLD_MS)) {
+			rc->auto_engaged = false;
+			rc->auto_poor_since = 0;
+			rc->auto_poor_members = 0;
+			rc_auto_restart(rc);
+		}
+	}
 }
 
 static bool rc_head_ok(const struct relay_coord *rc, uint8_t id, uint16_t members, uint32_t now)
@@ -313,6 +440,8 @@ uint16_t relay_coord_tick(struct relay_coord *rc, uint16_t member_mask, uint32_t
 		bool member = (member_mask & RC_BIT(i)) != 0;
 		if (jd[i].expected) {
 			t->direct_permille = jd[i].permille;
+			t->quality_ms = now;
+			if (rc->auto_engaged) rc_auto_pool(&rc->auto_balance[i], jd[i]);
 			if (jd[i].permille < RC_WEAK_PERMILLE) {
 				if (t->weak_windows < UINT8_MAX) {
 					t->weak_windows++;

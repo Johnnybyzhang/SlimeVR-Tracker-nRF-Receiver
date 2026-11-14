@@ -209,8 +209,10 @@ static void test_fast_repair(void)
 	CHECK(hid_count == 1);
 	CHECK(shadow_seen == (1U << 2)); /* valid repairs renew membership */
 	CHECK(relay_coord.peer[0][2].rssi_x8 == 480 && !relay_coord.peer[0][2].expected);
+	shadow_seen = 0;
 	esb_receive_repair(&packet, at);
 	CHECK(hid_count == 1);
+	CHECK(shadow_seen == 0); /* a duplicate renews nothing */
 	r.helper = 1;
 	packet.pipe = 2;
 	packet.length = relay_repair_encode(packet.data, &r);

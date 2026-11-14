@@ -79,12 +79,13 @@ declarations = [
 declarations.extend(declaration(name) for name in variables)
 declarations.append(extract.diagnostic_loss_declarations(source))
 declarations.append(relay_declarations(source))
+declarations.append('static bool relay_auto_ladder_paused(void);')
 functions = [function(name) for name in (
     'tdma_loss_reset_windows', 'tdma_pack_config', 'tdma_shadow_observe',
     'tdma_admissible_mask', 'tdma_shadow_forget_tracker', 'tdma_shadow_merge_locked', 'tdma_shadow_update',
     'tdma_membership_wait_ms', 'tdma_slot_ticks_for', 'tdma_staging_supported_locked',
     'tdma_apply_locked', 'tdma_apply_finish', 'tdma_advertised_config', 'tdma_recalculate',
-    'tracker_store_restore',
+    'tracker_store_restore', 'relay_auto_ladder_paused',
 )]
 functions.append('static uint32_t sys_get_be32(const uint8_t *p) {\n'
                  'return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | '
